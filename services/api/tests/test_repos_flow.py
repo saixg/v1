@@ -94,9 +94,11 @@ def test_stage_confirm_scan_and_browse(tmp_path):
         # Nothing is scanned until confirm.
         assert client.get(f"/repos/{repo_id}/status").json()["runs"] == []
 
+        # A forged commit_sha in the request body is simply ignored — the
+        # scan always runs against the SHA the server resolved at stage time.
         resp = client.post(
             f"/repos/{repo_id}/confirm",
-            json={"commit_sha": commit_sha, "excluded_paths": ["secrets"]},
+            json={"commit_sha": "forged-sha", "excluded_paths": ["secrets"]},
         )
         assert resp.status_code == 200, resp.text
         assert resp.json() == {"status": "scan_started"}
@@ -107,8 +109,11 @@ def test_stage_confirm_scan_and_browse(tmp_path):
         # A local folder is the user's own: never deleted after scanning.
         assert (tmp_path / "pkg" / "mod.py").exists()
 
+        # The pass_run was recorded under the staged SHA, not the forged one.
+        assert runs[0]["commit_sha"] == commit_sha
+
         # A second confirm must not double-scan.
-        again = client.post(f"/repos/{repo_id}/confirm", json={"commit_sha": commit_sha})
+        again = client.post(f"/repos/{repo_id}/confirm", json={})
         assert again.status_code == 409
 
         graph = client.get(
@@ -192,9 +197,7 @@ def test_upload_zip_stage_confirm_and_cleanup():
         assert (checkout / "app" / "main.py").is_file()
         assert [e["path"] for e in staged["preview"] if e["included"]] == ["app/main.py"]
 
-        resp = client.post(
-            f"/repos/{staged['id']}/confirm", json={"commit_sha": staged["commit_sha"]}
-        )
+        resp = client.post(f"/repos/{staged['id']}/confirm", json={})
         assert resp.status_code == 200, resp.text
         runs = _wait_for_scan(client, staged["id"])
         assert runs[0]["status"] == "succeeded", runs
@@ -232,9 +235,7 @@ def test_stage_rejects_bad_sources(tmp_path):
     )
     assert not_zip.status_code == 400
 
-    unknown = client.post(
-        "/repos/00000000-0000-0000-0000-000000000000/confirm", json={"commit_sha": "x"}
-    )
+    unknown = client.post("/repos/00000000-0000-0000-0000-000000000000/confirm", json={})
     assert unknown.status_code == 404
 
     assert _row_counts() == before

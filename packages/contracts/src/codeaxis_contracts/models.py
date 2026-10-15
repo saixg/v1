@@ -78,6 +78,7 @@ class Repo(BaseModel):
     remote_url: str | None = None
     local_path: str | None = None
     default_branch: str | None = None
+    staged_commit_sha: str | None = None
 
 
 class GithubSource(BaseModel):

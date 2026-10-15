@@ -47,7 +47,12 @@ def _register(checkout: MaterializedCheckout) -> Repo:
     try:
         with worker_connection() as conn:
             return create_repo(
-                conn, Repo(remote_url=checkout.remote_url, local_path=str(checkout.local_path))
+                conn,
+                Repo(
+                    remote_url=checkout.remote_url,
+                    local_path=str(checkout.local_path),
+                    staged_commit_sha=checkout.commit_sha,
+                ),
             )
     except BaseException:
         _discard_checkout(checkout.local_path)

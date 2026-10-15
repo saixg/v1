@@ -134,7 +134,6 @@ async def upload(file: UploadFile) -> StageRepoResponse:
 
 
 class ConfirmRequest(BaseModel):
-    commit_sha: str
     excluded_paths: list[str] = []
 
 
@@ -146,20 +145,25 @@ class ConfirmResponse(BaseModel):
 def confirm(
     repo_id: str, req: ConfirmRequest, background_tasks: BackgroundTasks
 ) -> ConfirmResponse:
-    """Start the scan with the user's exclusions. The checkout path is read
-    from the repo row written at stage time, never taken from the request —
-    a client must not be able to point the scanner (or its post-scan
-    cleanup) at an arbitrary folder."""
+    """Start the scan with the user's exclusions. Both the checkout path and
+    the commit_sha are read from the repo row written at stage time, never
+    taken from the request — a client must not be able to point the scanner
+    (or its post-scan cleanup) at an arbitrary folder, nor label the graph
+    with a SHA the server never resolved."""
     _require_uuid(repo_id)
     with api_connection() as conn:
         repo = get_repo(conn, repo_id)
-        if repo is None or repo.local_path is None:
+        if repo is None or repo.local_path is None or repo.staged_commit_sha is None:
             raise HTTPException(404, "repo not found")
         if list_pass_runs(conn, repo_id):
             raise HTTPException(409, "a scan has already been started for this repo")
 
     background_tasks.add_task(
-        run_scan_pass, repo_id, req.commit_sha, repo.local_path, frozenset(req.excluded_paths)
+        run_scan_pass,
+        repo_id,
+        repo.staged_commit_sha,
+        repo.local_path,
+        frozenset(req.excluded_paths),
     )
     return ConfirmResponse(status="scan_started")
 
