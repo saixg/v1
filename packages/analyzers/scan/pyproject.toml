@@ -1,0 +1,17 @@
+[project]
+name = "codeaxis-scan"
+version = "0.1.0"
+description = "Pass 1: tree-sitter scan. Source in, nodes and edges with provenance out. No DB, no network, no exec."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "codeaxis-contracts",
+  "tree-sitter>=0.23",
+  "tree-sitter-language-pack>=0.7",
+]
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/codeaxis_scan"]

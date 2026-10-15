@@ -1,0 +1,19 @@
+{
+  "name": "codeaxis",
+  "private": true,
+  "workspaces": [
+    "apps/*"
+  ],
+  "scripts": {
+    "dev:web": "npm run dev -w @codeaxis/web",
+    "build:web": "npm run build -w @codeaxis/web",
+    "lint:web": "npm run lint -w @codeaxis/web",
+    "db:push": "node --env-file-if-exists=.env scripts/db-push.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "supabase": "^2.120.0"
+  }
+}
