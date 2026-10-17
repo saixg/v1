@@ -1,8 +1,22 @@
 // Typed client for services/api. Shapes mirror the pydantic models in
-// packages/contracts and the response models in services/api — nothing here
-// is invented on the client side.
+// app/models/schemas.py and the response models in app/main.py — nothing
+// here is invented on the client side.
 
 export const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000").replace(/\/$/, "");
+
+// This module has no React hook of its own, so `ClerkTokenBridge` (mounted
+// once in layout.tsx) feeds it Clerk's `useAuth().getToken` here.
+type TokenGetter = () => Promise<string | null>;
+let tokenGetter: TokenGetter | null = null;
+
+export function setTokenGetter(fn: TokenGetter): void {
+  tokenGetter = fn;
+}
+
+async function authHeader(): Promise<Record<string, string>> {
+  const token = tokenGetter ? await tokenGetter() : null;
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
 
 export type AnalysisStatus = "verified" | "inferred" | "unknown" | "unanalyzed";
 
@@ -75,6 +89,89 @@ export interface FileContent {
   content_hash: string;
 }
 
+/** codeaxis_contracts.ResolutionStatus — architectural certainty of one
+ * edge's destination, distinct from the node/edge AnalysisStatus above. */
+export type ResolutionStatus = "resolved" | "ambiguous" | "unresolved" | "external";
+
+export type RelationshipEdgeKind = "imports" | "calls" | "extends" | "implements" | "tests";
+
+/** The connected node's identity on one relationship entry — enough to
+ * render and link to it without a second round-trip. */
+export interface RelationshipNode {
+  id: number | null;
+  name: string;
+  path: string | null;
+  kind: NodeKind;
+}
+
+/** One edge of a `/symbols/{id}` relationships list: `resolution_status` is
+ * null for edge kinds that predate the concept (there are none among
+ * RelationshipEdgeKind today, but the server type allows it), and `node` is
+ * null when the edge's destination never resolved (unresolved/external). */
+export interface RelationshipEntry {
+  kind: RelationshipEdgeKind;
+  resolution_status: ResolutionStatus | null;
+  attrs: Record<string, unknown>;
+  node: RelationshipNode | null;
+}
+
+/** services/api symbol_mechanics response: the raw node plus its depth-1
+ * relationships in both directions. */
+export interface SymbolDetail extends GraphNode {
+  relationships: {
+    outgoing: RelationshipEntry[];
+    incoming: RelationshipEntry[];
+  };
+}
+
+/** codeaxis_contracts.Coverage */
+export interface Coverage {
+  repo_id: string;
+  commit_sha: string;
+  area: string;
+  metric: string;
+  resolved: number;
+  total: number;
+  blockers: Record<string, number>;
+}
+
+export interface UnresolvedSummaryRow {
+  kind: string;
+  resolution_status: ResolutionStatus | null;
+  count: number;
+}
+
+export interface CoverageResponse {
+  coverage: Coverage[];
+  unresolved: UnresolvedSummaryRow[];
+}
+
+/** codeaxis_contracts.ProjectRole */
+export type ProjectRole = "owner" | "member";
+
+/** services/api ProjectWithRole */
+export interface Project {
+  id: string;
+  name: string;
+  owner_id: string;
+  created_at: string;
+  role: ProjectRole;
+}
+
+export type JobStatus = "queued" | "running" | "succeeded" | "failed";
+
+/** codeaxis_contracts.Job */
+export interface Job {
+  id: string;
+  project_id: string;
+  repo_id: string | null;
+  kind: "scan";
+  status: JobStatus;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export type IngestSource =
   | { kind: "github"; remote_url: string; ref?: string | null }
   | { kind: "local"; local_path: string; commit_sha: string };
@@ -93,7 +190,11 @@ export class ApiError extends Error {
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let resp: Response;
   try {
-    resp = await fetch(`${API_URL}${path}`, init);
+    const auth = await authHeader();
+    resp = await fetch(`${API_URL}${path}`, {
+      ...init,
+      headers: { ...auth, ...(init?.headers ?? {}) },
+    });
   } catch {
     throw new ApiError(0, `Could not reach the CodeAxis API at ${API_URL}. Check that it is running.`);
   }
@@ -127,21 +228,32 @@ function encodePath(path: string): string {
   return path.split("/").map(encodeURIComponent).join("/");
 }
 
-export function stageRepo(source: IngestSource): Promise<StageRepoResponse> {
-  return request("/repos/stage", json(source));
+export function getProjects(): Promise<{ projects: Project[] }> {
+  return request("/projects");
 }
 
-export function uploadZip(file: File): Promise<StageRepoResponse> {
+export function createProject(name: string): Promise<Project> {
+  return request("/projects", json({ name }));
+}
+
+export function stageRepo(source: IngestSource, projectId: string): Promise<StageRepoResponse> {
+  return request(`/repos/stage?${qs({ project_id: projectId })}`, json(source));
+}
+
+export function uploadZip(file: File, projectId: string): Promise<StageRepoResponse> {
   const form = new FormData();
   form.append("file", file);
-  return request("/repos/upload", { method: "POST", body: form });
+  return request(`/repos/upload?${qs({ project_id: projectId })}`, {
+    method: "POST",
+    body: form,
+  });
 }
 
 export function confirmScan(
   repoId: string,
   commitSha: string,
   excludedPaths: string[],
-): Promise<{ status: string }> {
+): Promise<{ status: string; job_id: string }> {
   return request(
     `/repos/${encodeURIComponent(repoId)}/confirm`,
     json({ commit_sha: commitSha, excluded_paths: excludedPaths }),
@@ -150,6 +262,10 @@ export function confirmScan(
 
 export function getStatus(repoId: string): Promise<{ runs: PassRun[] }> {
   return request(`/repos/${encodeURIComponent(repoId)}/status`);
+}
+
+export function getJob(jobId: string): Promise<Job> {
+  return request(`/jobs/${encodeURIComponent(jobId)}`);
 }
 
 export function getTreeRoot(repoId: string, commitSha: string): Promise<GraphNode> {
@@ -167,9 +283,19 @@ export async function getChildren(
   return body.children;
 }
 
-export function getSymbol(repoId: string, nodeId: number, commitSha: string): Promise<GraphNode> {
+export function getSymbol(
+  repoId: string,
+  nodeId: number,
+  commitSha: string,
+): Promise<SymbolDetail> {
   return request(
     `/repos/${encodeURIComponent(repoId)}/symbols/${nodeId}?${qs({ commit_sha: commitSha })}`,
+  );
+}
+
+export function getCoverage(repoId: string, commitSha: string): Promise<CoverageResponse> {
+  return request(
+    `/repos/${encodeURIComponent(repoId)}/coverage?${qs({ commit_sha: commitSha })}`,
   );
 }
 

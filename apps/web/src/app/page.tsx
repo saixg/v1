@@ -1,6 +1,9 @@
+import { auth } from "@clerk/nextjs/server";
+
 import { ImportForm } from "@/components/ImportForm";
 
-export default function OpenCodebasePage() {
+export default async function OpenCodebasePage() {
+  await auth.protect();
   return (
     <main className="mx-auto w-full max-w-xl px-4 py-12">
       <h1 className="text-2xl font-semibold tracking-tight">Open a codebase</h1>

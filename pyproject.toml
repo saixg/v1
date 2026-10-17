@@ -9,27 +9,15 @@ package = false
 
 [tool.uv.workspace]
 members = [
-  "packages/contracts",
-  "packages/graph",
-  "packages/analyzers/scan",
   "services/api",
-  "services/worker",
 ]
 
 [tool.uv.sources]
-codeaxis-contracts = { workspace = true }
-codeaxis-graph = { workspace = true }
-codeaxis-scan = { workspace = true }
 codeaxis-api = { workspace = true }
-codeaxis-worker = { workspace = true }
 
 [dependency-groups]
 dev = [
-  "codeaxis-contracts",
-  "codeaxis-graph",
-  "codeaxis-scan",
   "codeaxis-api",
-  "codeaxis-worker",
   "pytest>=8.3",
   "pytest-asyncio>=0.24",
   "httpx>=0.27",
@@ -41,11 +29,7 @@ dev = [
 [tool.pytest.ini_options]
 addopts = "--import-mode=importlib"
 testpaths = [
-  "packages/contracts/tests",
-  "packages/graph/tests",
-  "packages/analyzers/scan/tests",
   "services/api/tests",
-  "services/worker/tests",
   "infra/sandbox/tests",
 ]
 asyncio_mode = "auto"
@@ -64,4 +48,4 @@ venvPath = "."
 venv = ".venv"
 
 [tool.ruff.lint.isort]
-known-first-party = ["codeaxis_contracts", "codeaxis_graph", "codeaxis_scan", "codeaxis_api", "codeaxis_worker"]
+known-first-party = ["app"]

@@ -2,9 +2,92 @@
 
 import { useEffect, useState } from "react";
 
-import { ApiError, getFile, getSymbol, type FileContent, type GraphNode } from "@/lib/api";
+import {
+  ApiError,
+  getFile,
+  getSymbol,
+  type FileContent,
+  type GraphNode,
+  type RelationshipEntry,
+  type ResolutionStatus,
+  type SymbolDetail,
+} from "@/lib/api";
 
 import { StatusChip } from "./StatusChip";
+
+// Architectural certainty of an edge's destination — distinct from (and
+// rendered separately from) the node/edge StatusChip above. Never styled to
+// look more certain than it is: ambiguous/unresolved/external are visually
+// distinct from resolved, per build-plan.md's "unresolved/ambiguous visible".
+const RESOLUTION_STYLES: Record<ResolutionStatus, string> = {
+  resolved: "border-emerald-600/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400",
+  ambiguous: "border-amber-600/40 bg-amber-500/10 text-amber-700 dark:text-amber-400",
+  unresolved: "border-dashed border-rose-600/50 bg-rose-500/10 text-rose-700 dark:text-rose-400",
+  external: "border-sky-600/40 bg-sky-500/10 text-sky-700 dark:text-sky-400",
+};
+
+const RESOLUTION_LABELS: Record<ResolutionStatus, string> = {
+  resolved: "Resolved",
+  ambiguous: "Ambiguous",
+  unresolved: "Unresolved",
+  external: "External",
+};
+
+function ResolutionBadge({ status }: { status: ResolutionStatus | null }) {
+  if (status === null) {
+    return (
+      <span className="inline-flex shrink-0 items-center rounded border border-line bg-panel px-1.5 py-px text-[10px] font-medium uppercase leading-4 tracking-wide text-muted">
+        N/A
+      </span>
+    );
+  }
+  return (
+    <span
+      className={`inline-flex shrink-0 items-center rounded border px-1.5 py-px text-[10px] font-medium uppercase leading-4 tracking-wide ${RESOLUTION_STYLES[status]}`}
+    >
+      {RESOLUTION_LABELS[status]}
+    </span>
+  );
+}
+
+function RelationshipList({
+  entries,
+  onOpenNode,
+}: {
+  entries: RelationshipEntry[];
+  onOpenNode?: (nodeId: number) => void;
+}) {
+  if (entries.length === 0) {
+    return <p className="text-xs text-muted">None found.</p>;
+  }
+  return (
+    <ul className="space-y-1.5">
+      {entries.map((entry, i) => (
+        <li key={i} className="flex items-center gap-2 text-xs">
+          <span className="shrink-0 font-mono text-muted">{entry.kind}</span>
+          <ResolutionBadge status={entry.resolution_status} />
+          {entry.node ? (
+            <button
+              type="button"
+              onClick={() => entry.node?.id !== null && onOpenNode?.(entry.node!.id!)}
+              disabled={!onOpenNode || entry.node.id === null}
+              className="min-w-0 truncate text-left font-mono text-foreground underline-offset-2 hover:underline disabled:no-underline"
+              title={entry.node.path ?? entry.node.name}
+            >
+              {entry.node.name}
+            </button>
+          ) : (
+            <span className="truncate text-muted">
+              {typeof entry.attrs.callee_name === "string"
+                ? `“${entry.attrs.callee_name}” — not resolved to a node`
+                : "not resolved to a node"}
+            </span>
+          )}
+        </li>
+      ))}
+    </ul>
+  );
+}
 
 type Load<T> =
   | { state: "loading" }
@@ -111,20 +194,37 @@ export function Inspector({
   repoId,
   commitSha,
   node,
+  onSelectNode,
 }: {
   repoId: string;
   commitSha: string;
   node: GraphNode;
+  /** Lets a relationship entry's node become the next selection, reusing
+   * whatever selection state the parent (Workspace) already holds — same
+   * wiring as Explorer's onSelect, just triggered from inside the
+   * Inspector instead of the tree. */
+  onSelectNode?: (node: GraphNode) => void;
 }) {
   // The parent keys this component by node id, so each selection mounts a
   // fresh Inspector and these initial "loading" states are never stale.
   const nodeId = node.id;
   const path = node.path;
   const showsSource = (node.kind === "file" || node.kind === "symbol") && path !== null;
-  const [facts, setFacts] = useState<Load<GraphNode>>({ state: "loading" });
+  const [facts, setFacts] = useState<Load<SymbolDetail>>({ state: "loading" });
   const [source, setSource] = useState<Load<FileContent> | null>(
     showsSource ? { state: "loading" } : null,
   );
+
+  async function openNode(id: number) {
+    if (!onSelectNode) return;
+    try {
+      const detail = await getSymbol(repoId, id, commitSha);
+      onSelectNode(detail);
+    } catch {
+      // Best-effort navigation: if the fetch fails, stay on the current
+      // selection rather than surfacing a second error state.
+    }
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -214,20 +314,140 @@ export function Inspector({
         )}
 
         {n.kind === "symbol" && (
+          <Section title="Control-flow summary">
+            <NotYetComputed what="Control-flow summaries" />
+          </Section>
+        )}
+
+        {(n.kind === "file" || n.kind === "symbol") && (
           <>
-            <Section title="Callees">
-              <NotYetComputed what="Callee lists" />
+            <Section title="Incoming relationships">
+              {facts.state === "loading" ? (
+                <p className="text-xs text-muted">Loading…</p>
+              ) : facts.state === "error" ? (
+                <p className="text-xs text-muted">Couldn&apos;t load relationships.</p>
+              ) : (
+                <RelationshipList entries={facts.value.relationships.incoming} onOpenNode={openNode} />
+              )}
             </Section>
-            <Section title="Control-flow summary">
-              <NotYetComputed what="Control-flow summaries" />
+
+            <Section title="Outgoing relationships">
+              {facts.state === "loading" ? (
+                <p className="text-xs text-muted">Loading…</p>
+              ) : facts.state === "error" ? (
+                <p className="text-xs text-muted">Couldn&apos;t load relationships.</p>
+              ) : (
+                <RelationshipList entries={facts.value.relationships.outgoing} onOpenNode={openNode} />
+              )}
+            </Section>
+
+            {/* Impact reuses the outgoing-relationships data under an
+                "if this changes" framing rather than a third fetch: what's
+                one hop reachable from this node is exactly what could be
+                affected by changing it. A separate impact endpoint would
+                return the same edges today, so this avoids a duplicate
+                round-trip; if impact analysis later needs multi-hop or
+                different edge kinds, it should become its own fetch. */}
+            <Section title="Impact">
+              {facts.state === "loading" ? (
+                <p className="text-xs text-muted">Loading…</p>
+              ) : facts.state === "error" ? (
+                <p className="text-xs text-muted">Couldn&apos;t load impact data.</p>
+              ) : (
+                <>
+                  <p className="text-xs text-muted">
+                    If this changes, these may be affected (one hop out, same edges as above):
+                  </p>
+                  <RelationshipList
+                    entries={facts.value.relationships.outgoing}
+                    onOpenNode={openNode}
+                  />
+                </>
+              )}
+            </Section>
+
+            <Section title="Tests">
+              {facts.state === "loading" ? (
+                <p className="text-xs text-muted">Loading…</p>
+              ) : facts.state === "error" ? (
+                <p className="text-xs text-muted">Couldn&apos;t load test associations.</p>
+              ) : (
+                (() => {
+                  const testEdges = [
+                    ...facts.value.relationships.incoming,
+                    ...facts.value.relationships.outgoing,
+                  ].filter((e) => e.kind === "tests");
+                  if (testEdges.length === 0) {
+                    return (
+                      <p className="text-xs text-muted">
+                        No test association found for this node.
+                      </p>
+                    );
+                  }
+                  return (
+                    <ul className="space-y-1.5">
+                      {testEdges.map((e, i) => (
+                        <li key={i} className="space-y-0.5 text-xs">
+                          <div className="flex items-center gap-2">
+                            <ResolutionBadge status={e.resolution_status} />
+                            <span className="font-mono">{e.node?.name ?? "(unresolved)"}</span>
+                          </div>
+                          {typeof e.attrs.evidence === "string" && (
+                            <p className="pl-1 text-muted">{e.attrs.evidence}</p>
+                          )}
+                        </li>
+                      ))}
+                    </ul>
+                  );
+                })()
+              )}
             </Section>
           </>
         )}
-        {n.kind === "file" && (
-          <Section title="Imports and dependents">
-            <NotYetComputed what="Import and call relationships" />
-          </Section>
-        )}
+
+        <Section title="History">
+          {n.attrs.churn_commits !== undefined || n.attrs.recent_commits !== undefined ? (
+            <div className="space-y-1.5 text-xs">
+              {n.attrs.churn_commits !== undefined && (
+                <p>
+                  <span className="text-muted">Churn:</span>{" "}
+                  {String(n.attrs.churn_commits)} commit(s) touched this file.
+                </p>
+              )}
+              {Array.isArray(n.attrs.recent_commits) && n.attrs.recent_commits.length > 0 && (
+                <ul className="space-y-1">
+                  {(n.attrs.recent_commits as Array<Record<string, unknown>>).map((c, i) => (
+                    <li key={i} className="font-mono">
+                      {String(c.sha).slice(0, 8)} · {String(c.date)} · {String(c.subject)}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          ) : (
+            <p className="text-xs text-muted">
+              No git history was recorded for this node (no `.git` directory at scan time, or it
+              has never been committed).
+            </p>
+          )}
+        </Section>
+
+        <Section title="Execution context">
+          {n.attrs.entry_point === true ? (
+            <p className="text-xs">
+              Detected entry point
+              {n.attrs.entry_point_reason
+                ? ` — ${
+                    Array.isArray(n.attrs.entry_point_reason)
+                      ? n.attrs.entry_point_reason.join(", ")
+                      : String(n.attrs.entry_point_reason)
+                  }.`
+                : "."}
+            </p>
+          ) : (
+            <p className="text-xs text-muted">Not a detected entry point.</p>
+          )}
+        </Section>
       </div>
 
       <Section title="Provenance">

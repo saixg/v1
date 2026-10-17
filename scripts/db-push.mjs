@@ -1,4 +1,4 @@
-// Apply packages/graph/supabase/migrations to the database in DATABASE_URL.
+// Apply supabase/migrations to the database in DATABASE_URL.
 // Run via `npm run db:push`, which loads .env with --env-file-if-exists.
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
@@ -10,6 +10,6 @@ if (!url) {
 }
 
 const cli = createRequire(import.meta.url).resolve("supabase/dist/supabase.js");
-const args = ["db", "push", "--workdir", "packages/graph", "--db-url", url, ...process.argv.slice(2)];
+const args = ["db", "push", "--workdir", ".", "--db-url", url, ...process.argv.slice(2)];
 const { status } = spawnSync(process.execPath, [cli, ...args], { stdio: "inherit" });
 process.exit(status ?? 1);

@@ -1,0 +1,12 @@
+{
+  "imports": [
+    { "src_path": "a.py", "dst_path": "b.py", "resolution_status": "resolved" }
+  ],
+  "entry_points": ["a.py"],
+  "tests": [
+    { "src_path": "test_a.py", "dst_path": "a.py" }
+  ],
+  "coverage": {
+    "files_parsed": { "resolved": 3, "total": 5 }
+  }
+}

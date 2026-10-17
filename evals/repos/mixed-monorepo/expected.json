@@ -1,0 +1,22 @@
+{
+  "imports": [
+    {
+      "src_path": "py_service/a.py",
+      "dst_path": "py_service/b.py",
+      "resolution_status": "resolved"
+    },
+    {
+      "src_path": "ts_service/a.ts",
+      "dst_path": "ts_service/b.ts",
+      "resolution_status": "resolved"
+    }
+  ],
+  "entry_points": ["py_service/a.py"],
+  "tests": [
+    { "src_path": "py_service/test_a.py", "dst_path": "py_service/a.py" },
+    { "src_path": "ts_service/a.test.ts", "dst_path": "ts_service/a.ts" }
+  ],
+  "coverage": {
+    "files_parsed": { "resolved": 6, "total": 9 }
+  }
+}

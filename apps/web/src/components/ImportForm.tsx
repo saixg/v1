@@ -4,6 +4,7 @@ import { useRouter } from "next/navigation";
 import { useState, type FormEvent } from "react";
 
 import { rememberStaged, stageRepo, uploadZip, type StageRepoResponse } from "@/lib/api";
+import { ProjectPicker } from "@/components/ProjectPicker";
 
 type Mode = "github" | "local" | "zip";
 
@@ -24,30 +25,33 @@ export function ImportForm() {
   const [localPath, setLocalPath] = useState("");
   const [commitSha, setCommitSha] = useState("");
   const [zipFile, setZipFile] = useState<File | null>(null);
+  const [projectId, setProjectId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   async function onSubmit(e: FormEvent) {
     e.preventDefault();
     setError(null);
+    if (!projectId) {
+      setError("Choose or create a project first.");
+      return;
+    }
     setBusy(true);
     try {
       let staged: StageRepoResponse;
       if (mode === "github") {
-        staged = await stageRepo({
-          kind: "github",
-          remote_url: remoteUrl.trim(),
-          ref: ref.trim() || null,
-        });
+        staged = await stageRepo(
+          { kind: "github", remote_url: remoteUrl.trim(), ref: ref.trim() || null },
+          projectId,
+        );
       } else if (mode === "local") {
-        staged = await stageRepo({
-          kind: "local",
-          local_path: localPath.trim(),
-          commit_sha: commitSha.trim(),
-        });
+        staged = await stageRepo(
+          { kind: "local", local_path: localPath.trim(), commit_sha: commitSha.trim() },
+          projectId,
+        );
       } else {
         if (!zipFile) throw new Error("Choose a .zip file to upload.");
-        staged = await uploadZip(zipFile);
+        staged = await uploadZip(zipFile, projectId);
       }
       rememberStaged(staged);
       router.push(
@@ -61,6 +65,7 @@ export function ImportForm() {
 
   const canSubmit =
     !busy &&
+    projectId !== null &&
     (mode === "github"
       ? remoteUrl.trim() !== ""
       : mode === "local"
@@ -69,6 +74,8 @@ export function ImportForm() {
 
   return (
     <form onSubmit={onSubmit} className="space-y-5">
+      <ProjectPicker value={projectId} onChange={setProjectId} />
+
       <div role="tablist" className="flex gap-1 rounded-lg border border-line bg-panel p-1">
         {TABS.map((t) => (
           <button

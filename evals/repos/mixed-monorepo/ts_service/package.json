@@ -1,0 +1,8 @@
+{
+  "name": "ts-service",
+  "version": "1.0.0",
+  "main": "a.ts",
+  "dependencies": {
+    "left-pad": "1.3.0"
+  }
+}

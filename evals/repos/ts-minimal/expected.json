@@ -1,0 +1,12 @@
+{
+  "imports": [
+    { "src_path": "a.ts", "dst_path": "b.ts", "resolution_status": "resolved" }
+  ],
+  "entry_points": ["a.ts"],
+  "tests": [
+    { "src_path": "a.test.ts", "dst_path": "a.ts" }
+  ],
+  "coverage": {
+    "files_parsed": { "resolved": 3, "total": 5 }
+  }
+}

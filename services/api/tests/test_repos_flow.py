@@ -13,8 +13,8 @@ import pytest
 from dotenv import load_dotenv
 from fastapi.testclient import TestClient
 
-from codeaxis_api.main import app
-from codeaxis_graph import worker_connection
+from app.knowledge import worker_connection
+from app.main import app
 
 load_dotenv()
 
@@ -22,7 +22,17 @@ pytestmark = pytest.mark.skipif(
     not os.environ.get("WORKER_DATABASE_URL"), reason="WORKER_DATABASE_URL not set"
 )
 
-TABLES = ("blobs", "edges", "nodes", "coverage", "pass_runs", "repos")
+TABLES = ("blobs", "edges", "nodes", "coverage", "pass_runs", "jobs", "repos")
+
+
+@pytest.fixture
+def member(client, make_user, auth_header) -> tuple[TestClient, str]:
+    """A signed-in user who owns a fresh project: a client that sends their
+    bearer token on every request, and the project's id."""
+    headers = auth_header(make_user())
+    resp = client.post("/projects", json={"name": "flow"}, headers=headers)
+    assert resp.status_code == 201, resp.text
+    return TestClient(app, headers=headers), resp.json()["id"]
 
 
 def _row_counts() -> dict[str, int]:
@@ -54,14 +64,14 @@ def _wait_for_scan(client: TestClient, repo_id: str) -> list:
     pytest.fail(f"scan did not finish: {runs}")
 
 
-def test_stage_confirm_scan_and_browse(tmp_path):
+def test_stage_confirm_scan_and_browse(tmp_path, member):
     (tmp_path / "pkg").mkdir()
     (tmp_path / "pkg" / "mod.py").write_text("def hello():\n    return 'hi'\n")
     (tmp_path / "secrets").mkdir()
     (tmp_path / "secrets" / "keys.py").write_text("def leaked():\n    pass\n")
     (tmp_path / "node_modules").mkdir()
 
-    client = TestClient(app)
+    client, project_id = member
     commit_sha = "deadbeef"
     before = _row_counts()
     repo_ids: list[str] = []
@@ -69,6 +79,7 @@ def test_stage_confirm_scan_and_browse(tmp_path):
     try:
         resp = client.post(
             "/repos/stage",
+            params={"project_id": project_id},
             json={"kind": "local", "local_path": str(tmp_path), "commit_sha": commit_sha},
         )
         assert resp.status_code == 200, resp.text
@@ -101,7 +112,8 @@ def test_stage_confirm_scan_and_browse(tmp_path):
             json={"commit_sha": "forged-sha", "excluded_paths": ["secrets"]},
         )
         assert resp.status_code == 200, resp.text
-        assert resp.json() == {"status": "scan_started"}
+        assert resp.json()["status"] == "scan_started"
+        assert client.get(f"/jobs/{resp.json()['job_id']}").status_code == 200
 
         runs = _wait_for_scan(client, repo_id)
         assert runs[0]["status"] == "succeeded", runs
@@ -173,19 +185,21 @@ def test_stage_confirm_scan_and_browse(tmp_path):
     assert _row_counts() == before
 
 
-def test_upload_zip_stage_confirm_and_cleanup():
+def test_upload_zip_stage_confirm_and_cleanup(member):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("app/main.py", "def main():\n    return 1\n")
     payload = buf.getvalue()
 
-    client = TestClient(app)
+    client, project_id = member
     before = _row_counts()
     repo_ids: list[str] = []
 
     try:
         resp = client.post(
-            "/repos/upload", files={"file": ("repo.zip", payload, "application/zip")}
+            "/repos/upload",
+            params={"project_id": project_id},
+            files={"file": ("repo.zip", payload, "application/zip")},
         )
         assert resp.status_code == 200, resp.text
         staged = resp.json()
@@ -216,22 +230,101 @@ def test_upload_zip_stage_confirm_and_cleanup():
     assert _row_counts() == before
 
 
-def test_stage_rejects_bad_sources(tmp_path):
-    client = TestClient(app)
+def test_coverage_and_symbol_relationships(tmp_path, member):
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "b.py").write_text("def helper():\n    return 'hi'\n")
+    (tmp_path / "pkg" / "a.py").write_text(
+        "from pkg.b import helper\n\ndef main():\n    return helper()\n"
+    )
+
+    client, project_id = member
+    commit_sha = "coverage-test"
+    before = _row_counts()
+    repo_ids: list[str] = []
+
+    try:
+        resp = client.post(
+            "/repos/stage",
+            params={"project_id": project_id},
+            json={"kind": "local", "local_path": str(tmp_path), "commit_sha": commit_sha},
+        )
+        assert resp.status_code == 200, resp.text
+        repo_id = resp.json()["id"]
+        repo_ids.append(repo_id)
+
+        resp = client.post(f"/repos/{repo_id}/confirm", json={})
+        assert resp.status_code == 200, resp.text
+        runs = _wait_for_scan(client, repo_id)
+        assert runs[0]["status"] == "succeeded", runs
+
+        coverage_resp = client.get(f"/repos/{repo_id}/coverage", params={"commit_sha": commit_sha})
+        assert coverage_resp.status_code == 200, coverage_resp.text
+        body = coverage_resp.json()
+        assert "coverage" in body and "unresolved" in body
+        assert isinstance(body["coverage"], list) and len(body["coverage"]) > 0
+        assert isinstance(body["unresolved"], list)
+        for row in body["unresolved"]:
+            assert {"kind", "resolution_status", "count"} <= row.keys()
+
+        graph = client.get(
+            f"/repos/{repo_id}/graph", params={"commit_sha": commit_sha, "depth": 3}
+        ).json()
+        # The relationship extractor attributes imports/calls/extends/
+        # implements/tests edges to the *file* node (one per-file pass),
+        # not the individual symbol inside it, so outgoing relationships
+        # are inspected from a.py's file node.
+        a_file = next(n for n in graph["nodes"] if n["path"] == "pkg/a.py")
+
+        detail = client.get(
+            f"/repos/{repo_id}/symbols/{a_file['id']}", params={"commit_sha": commit_sha}
+        ).json()
+        assert "relationships" in detail
+        outgoing = detail["relationships"]["outgoing"]
+        assert any(
+            e["kind"] == "calls" and e["node"] is not None and e["node"]["name"] == "helper"
+            for e in outgoing
+        )
+        for entry in outgoing:
+            assert {"kind", "resolution_status", "attrs", "node"} <= entry.keys()
+
+        b_file = next(n for n in graph["nodes"] if n["path"] == "pkg/b.py")
+        b_detail = client.get(
+            f"/repos/{repo_id}/symbols/{b_file['id']}", params={"commit_sha": commit_sha}
+        ).json()
+        incoming = b_detail["relationships"]["incoming"]
+        assert any(
+            e["kind"] == "imports" and e["node"] is not None and e["node"]["path"] == "pkg/a.py"
+            for e in incoming
+        )
+    finally:
+        _cleanup(repo_ids)
+
+    assert _row_counts() == before
+
+
+def test_stage_rejects_bad_sources(tmp_path, member):
+    client, project_id = member
     before = _row_counts()
 
     missing = client.post(
         "/repos/stage",
+            params={"project_id": project_id},
         json={"kind": "local", "local_path": str(tmp_path / "nope"), "commit_sha": "x"},
     )
     assert missing.status_code == 400
     assert "does not exist" in missing.json()["detail"]
 
-    bad_scheme = client.post("/repos/stage", json={"kind": "github", "remote_url": "file:///etc"})
+    bad_scheme = client.post(
+        "/repos/stage",
+        params={"project_id": project_id},
+        json={"kind": "github", "remote_url": "file:///etc"},
+    )
     assert bad_scheme.status_code == 400
 
     not_zip = client.post(
-        "/repos/upload", files={"file": ("x.zip", b"not a zip", "application/zip")}
+        "/repos/upload",
+        params={"project_id": project_id},
+        files={"file": ("x.zip", b"not a zip", "application/zip")},
     )
     assert not_zip.status_code == 400
 

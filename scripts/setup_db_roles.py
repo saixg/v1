@@ -11,8 +11,8 @@ import secrets
 import sys
 
 import psycopg
-from psycopg import sql
 from dotenv import load_dotenv
+from psycopg import sql
 
 load_dotenv()
 
