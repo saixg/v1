@@ -127,6 +127,76 @@ Implemented as three parallel passes (A: relationship extraction/manifests/git h
 
 Phase 2 exit criteria ("on golden repos, edges trace to source; unresolved/ambiguous visible; Inspector uses the same relationships as the explorer") are met: the eval harness proves edges trace to source with correct resolution status; the Inspector surfaces `ambiguous`/`unresolved`/`external` edges explicitly rather than hiding them; the Inspector's relationship data comes from the same `codeaxis.edges` rows the Explorer's graph view reads.
 
+## 2026-10-17 update: the three carried-over gaps closed before Phase 3
+
+All three items flagged as deferred-but-not-forgotten across the Phase 1/2 close-outs:
+
+1. **Storage vs. blobs-in-Postgres** — resolved per the recommendation already logged above: blobs-in-Postgres is now the canonical design. `build-plan.md` Part 2's Storage row and Part 4.A.6's "store tarball in Storage" step rewritten to describe what's actually built (`codeaxis.blobs`, content-hash-keyed per-file text), rather than leaving the spec and the shipped code contradicting each other.
+2. **Monaco code viewer** — `apps/web/src/components/Inspector.tsx`'s `SourceView` now renders `@monaco-editor/react` (new dependency, hoisted to the workspace root `node_modules`) instead of a plain `<pre>` block: syntax highlighting by extension (`monacoLanguage()`, covering the languages the scanner's tree-sitter tier list already supports plus a few inventory-tier extras), read-only (`readOnly`/`domReadOnly`), a decoration (`codeaxis-symbol-span-line`, new rule in `globals.css`) highlighting a symbol's line span and auto-scrolling to it via `revealLineInCenter`, and theme following the OS `prefers-color-scheme` the rest of the app's Tailwind `dark:` classes already use (no manual toggle existed to hook into). The old `MAX_FILE_LINES`/"Show all N lines" truncation is gone — Monaco virtualizes rendering, so the artificial 2000-line cap was only working around the `<pre>` approach's limits, not a real one.
+3. **`test_repos_flow.py` test isolation** — `_row_counts()`'s whole-table snapshot-and-diff pattern (broken under any concurrent DB writer, since it counted rows it didn't own) replaced with `_assert_no_rows_for(repo_ids)`, which checks only the specific repo ids each test created and cleaned up, scoped by `repo_id`/`id` exactly like `_cleanup()` already was. The test that creates no repo (`test_stage_rejects_bad_sources`) now has no row-count assertion at all — nothing it does could leave a row behind to check for.
+
+**Verified:** `uv run ruff check .` / `uv run pyright` clean (backend); `npm run build`/`lint --prefix apps/web` clean, confirming the Monaco wiring type-checks and the app still builds. Full `pytest` run was kicked off but not yet confirmed complete as of this entry — see the next update if one exists before trusting a specific pass count.
+
+## 2026-10-18 update: Phase 3 verified end-to-end; its frontend surfaces built
+
+Picked up the uncommitted Phase 3 backend work (chunks, summaries, FTS + embeddings,
+hybrid retrieval, grounded chat, Inspector explanations, origin tags) and verified it
+rather than trusting it.
+
+**Verified, not assumed:** `uv run ruff check .` clean, `uv run pyright` 0 errors,
+`uv run pytest -q -rs` -> **327 passed, 1 skipped** (the skip is `test_sandbox_env.py`,
+Docker not installed), `npm run lint`/`npm run build --prefix apps/web` clean,
+`evals/graders/graph_sanity.py` all 3 fixtures PASS, `evals/graders/citations.py` both
+graders PASS (grounding + retrieval recall@5 = 1.0, MRR 0.73).
+
+**Fixed to get there (all pre-existing, none of it Phase 3 code):**
+- `scripts/setup_db_roles.py` -- grant blocks are now `sql.SQL(...)` literals, so a
+  runtime `str` is no longer passed where psycopg's current typing wants a
+  `LiteralString`; also reflowed under the 100-column limit.
+- `scripts/check_db.py` -- `fetchone()` can return `None`; handled instead of subscripted.
+- `evals/graders/graph_sanity.py` -- one over-long signature reflowed.
+- `services/api/tests/test_projects_membership.py` -- asserted `runs == ["succeeded"]`,
+  which was true only before Phase 3 appended passes. It now asserts the **scan** run
+  (analyzer `tree-sitter`) succeeded and that every later run is a semantic one
+  (`semantic-chunk`, `semantic`). With no `ANTHROPIC_API_KEY` in the test environment the
+  semantic pass records a deliberate `failed` + `skipped: ...` pass_run -- that is the
+  designed, documented behaviour (`app/analysis/semantic/writer.py` explains why there is
+  no `skipped` status), so the test was stale, not the code.
+
+**Built this session -- the Phase 3 frontend, which did not exist:** no component called
+`/search`, `/chat` or either `/explanation` route; the backend had shipped with no surface.
+- `apps/web/src/lib/api.ts`: `Citation`, `ChatCitation`, `StageOutcome`, `RetrievalBudget`,
+  `RetrievedSpan`, `SearchResponse`, `ChatClaim`, `ChatResponse`, `CitationCheckFailure`,
+  `ChatMessage`, `ChatThread`, `Explanation` + `searchRepo`, `askRepo`, `getChatThread`,
+  `getNodeExplanation`, `getScopeExplanation`. `ApiError` now also carries the parsed
+  `detail` payload, because the chat route's 422 answers with a structured object (the
+  rejected-citation list) rather than a string.
+- `apps/web/src/components/AskView.tsx` (new): Ask (grounded chat) and Search (hybrid
+  retrieval) over one snapshot. Each answer renders as separate claims, each with its
+  file+line citations; a claim with no citation is labelled as unbacked rather than read as
+  fact; `in_evidence: false` is badged, not hidden; every retrieval stage reports ran/skipped
+  with its reason; the token budget and dropped-for-budget count are shown. The 422
+  citation-check failure is rendered as a rejection with its per-citation reasons -- the
+  answer is reported discarded, never reworded. `status: "no_evidence"` shows the server's
+  own sentence instead of an empty state.
+- `apps/web/src/components/Inspector.tsx`: a new **Purpose** section serving the stored
+  explanation for the selected node, badged by `origin` ("AI observation (inferred)"), with
+  the spans it was written from and a note of how many chunks/child summaries fed it. A 404
+  shows the server's reason verbatim -- explanations are never generated on request.
+- `apps/web/src/app/repos/[id]/Workspace.tsx`: third tab, **Ask**. A citation that carries a
+  `node_id` is clickable and becomes the Explorer/Inspector selection; one without a node id
+  is plain text, because there is no path -> node lookup and inventing one would fabricate a
+  link the graph does not hold.
+
+**Phase 3 exit criterion** ("cited answers pass automated citation-exists check") is met and
+now reachable from the UI. Pillar 1 is complete in substance.
+
+**Not done / still open:** nothing in this session was committed (large working tree still
+uncommitted); streaming chat remains the documented gap (`chat.STREAMING_GAP`); the
+`supabase db push` migration-history drift noted earlier is unchanged; no live click-through
+of the Ask tab against a running API + DB was performed -- lint, typecheck, build and the
+backend tests are the evidence here, not a browser session.
+
 ## Discrepancies (not silently resolved)
 
 1. **Two conflicting source-of-truth documents describe different products under the same name.**

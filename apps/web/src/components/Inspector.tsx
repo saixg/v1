@@ -1,11 +1,17 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+
+import Editor, { type OnMount } from "@monaco-editor/react";
+import type { editor as MonacoEditorNS } from "monaco-editor";
 
 import {
   ApiError,
   getFile,
+  getNodeExplanation,
   getSymbol,
+  type Citation,
+  type Explanation,
   type FileContent,
   type GraphNode,
   type RelationshipEntry,
@@ -102,7 +108,59 @@ function errorState(err: unknown): Load<never> {
   };
 }
 
-const MAX_FILE_LINES = 2000;
+const MONACO_LANGUAGE_BY_EXT: Record<string, string> = {
+  py: "python",
+  js: "javascript",
+  jsx: "javascript",
+  mjs: "javascript",
+  cjs: "javascript",
+  ts: "typescript",
+  tsx: "typescript",
+  go: "go",
+  rs: "rust",
+  java: "java",
+  rb: "ruby",
+  php: "php",
+  c: "c",
+  h: "c",
+  cpp: "cpp",
+  cc: "cpp",
+  cxx: "cpp",
+  hpp: "cpp",
+  cs: "csharp",
+  json: "json",
+  yml: "yaml",
+  yaml: "yaml",
+  md: "markdown",
+  sh: "shell",
+  bash: "shell",
+  sql: "sql",
+  html: "html",
+  css: "css",
+  toml: "ini",
+};
+
+function monacoLanguage(path: string | null): string {
+  if (!path) return "plaintext";
+  const ext = path.split(".").pop()?.toLowerCase() ?? "";
+  return MONACO_LANGUAGE_BY_EXT[ext] ?? "plaintext";
+}
+
+/** Tracks the OS/browser light-dark preference so Monaco's theme follows
+ * the same `prefers-color-scheme` signal the rest of the app's `dark:`
+ * Tailwind classes already respond to (globals.css has no manual toggle). */
+function usePrefersDark(): boolean {
+  const [dark, setDark] = useState(
+    () => typeof window !== "undefined" && window.matchMedia("(prefers-color-scheme: dark)").matches,
+  );
+  useEffect(() => {
+    const mql = window.matchMedia("(prefers-color-scheme: dark)");
+    const onChange = (e: MediaQueryListEvent) => setDark(e.matches);
+    mql.addEventListener("change", onChange);
+    return () => mql.removeEventListener("change", onChange);
+  }, []);
+  return dark;
+}
 
 const UNANALYZED_REASONS: Record<string, string> = {
   file_too_large: "The file is over the scanner's size cap, so it was not read.",
@@ -123,51 +181,67 @@ function span(node: GraphNode): string {
 }
 
 function SourceView({
+  path,
   content,
   from,
   to,
 }: {
+  path: string | null;
   content: string;
   from: number | null;
   to: number | null;
 }) {
-  const [showAll, setShowAll] = useState(false);
-  const lines = content.split(/\r?\n/);
-  let start = 1;
-  let end = lines.length;
-  if (from !== null) {
-    start = from;
-    end = to ?? from;
-  } else if (!showAll && lines.length > MAX_FILE_LINES) {
-    end = MAX_FILE_LINES;
-  }
-  const shown = lines.slice(start - 1, end);
-  const gutter = String(end).length;
+  const dark = usePrefersDark();
+  const editorRef = useRef<MonacoEditorNS.IStandaloneCodeEditor | null>(null);
+  const decorationsRef = useRef<MonacoEditorNS.IEditorDecorationsCollection | null>(null);
+
+  const highlightSpan = useCallback(
+    (editor: MonacoEditorNS.IStandaloneCodeEditor) => {
+      decorationsRef.current?.clear();
+      if (from === null) return;
+      decorationsRef.current = editor.createDecorationsCollection([
+        {
+          range: { startLineNumber: from, startColumn: 1, endLineNumber: to ?? from, endColumn: 1 },
+          options: { isWholeLine: true, className: "codeaxis-symbol-span-line" },
+        },
+      ]);
+      editor.revealLineInCenter(from);
+    },
+    [from, to],
+  );
+
+  const handleMount: OnMount = (editor) => {
+    editorRef.current = editor;
+    highlightSpan(editor);
+  };
+
+  // SourceView is remounted (keyed by node id) whenever the selected node
+  // changes, so this only re-runs within one node's own lifetime — it
+  // exists for completeness, not because `from`/`to` are expected to change
+  // under a stable key.
+  useEffect(() => {
+    if (editorRef.current) highlightSpan(editorRef.current);
+  }, [highlightSpan]);
 
   return (
-    <div>
-      <pre className="max-h-[60vh] overflow-auto rounded-md border border-line bg-panel py-2 font-mono text-xs leading-5">
-        {shown.map((line, i) => (
-          <div key={start + i} className="flex">
-            <span
-              className="select-none pl-3 pr-4 text-right text-muted"
-              style={{ minWidth: `${gutter + 3}ch` }}
-            >
-              {start + i}
-            </span>
-            <code className="whitespace-pre pr-3">{line || " "}</code>
-          </div>
-        ))}
-      </pre>
-      {from === null && end < lines.length && (
-        <button
-          type="button"
-          onClick={() => setShowAll(true)}
-          className="mt-2 text-xs font-medium text-accent"
-        >
-          Show all {lines.length} lines
-        </button>
-      )}
+    <div className="overflow-hidden rounded-md border border-line">
+      <Editor
+        height="60vh"
+        language={monacoLanguage(path)}
+        value={content}
+        theme={dark ? "vs-dark" : "light"}
+        onMount={handleMount}
+        options={{
+          readOnly: true,
+          domReadOnly: true,
+          minimap: { enabled: false },
+          fontSize: 12,
+          fontFamily: "ui-monospace, SFMono-Regular, Cascadia Code, Consolas, monospace",
+          scrollBeyondLastLine: false,
+          renderLineHighlight: from === null ? "line" : "none",
+          wordWrap: "off",
+        }}
+      />
     </div>
   );
 }
@@ -187,6 +261,72 @@ function NotYetComputed({ what }: { what: string }) {
       {what} arrive after call-graph resolution (Step 2). They have not been computed for this
       repository yet, so none are shown. This does not mean there are none.
     </p>
+  );
+}
+
+function citationLabel(c: Citation): string {
+  const lines = c.line_start === c.line_end ? `${c.line_start}` : `${c.line_start}–${c.line_end}`;
+  return `${c.path}:${lines}`;
+}
+
+/** The stored grounded explanation for this node, or an honest account of
+ * why there is none. Three things this never does: generate prose on
+ * request (the server only serves what the summary pass wrote), present the
+ * text as parsed fact (it is labelled by its `origin`), or show a sentence
+ * without the spans it was written from. */
+function PurposeSection({ load }: { load: Load<Explanation> }) {
+  if (load.state === "loading") {
+    return <p className="text-xs text-muted">Loading explanation…</p>;
+  }
+  if (load.state === "error") {
+    return (
+      <p className="rounded-md border border-dashed border-line px-3 py-2 text-xs text-muted">
+        {load.notFound ? load.message : `Couldn't load the explanation: ${load.message}`}
+      </p>
+    );
+  }
+
+  const e = load.value;
+  return (
+    <div className="space-y-2">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="rounded border border-violet-600/40 bg-violet-500/10 px-1.5 py-0.5 text-[11px] font-medium text-violet-700 dark:text-violet-300">
+          {e.origin === "inferred" ? "AI observation (inferred)" : e.origin}
+        </span>
+        <span className="text-[11px] text-muted">
+          {e.level} scope · {e.analyzer} {e.analyzer_version}
+          {e.model && ` · ${e.model}`}
+        </span>
+      </div>
+      <p className="text-sm">{e.summary}</p>
+      {e.citations.length === 0 ? (
+        <p className="text-[11px] text-amber-700 dark:text-amber-400">
+          Stored without citations — nothing here is backed by a source span.
+        </p>
+      ) : (
+        <ul className="flex flex-wrap gap-1.5">
+          {e.citations.map((c, i) => (
+            <li
+              key={i}
+              className="rounded border border-line bg-panel px-1.5 py-0.5 font-mono text-[11px] text-muted"
+              title="A span of this snapshot the explanation was written from."
+            >
+              {citationLabel(c)}
+            </li>
+          ))}
+        </ul>
+      )}
+      <p className="text-[11px] text-muted">
+        Written from {e.evidence.chunk_ids.length} indexed chunk
+        {e.evidence.chunk_ids.length === 1 ? "" : "s"}
+        {e.evidence.children.length > 0 &&
+          ` and ${e.evidence.children.length} child summar${
+            e.evidence.children.length === 1 ? "y" : "ies"
+          }`}
+        {e.evidence.truncated && ", truncated to fit the input budget"}. Static analysis only —
+        nothing was executed.
+      </p>
+    </div>
   );
 }
 
@@ -214,6 +354,7 @@ export function Inspector({
   const [source, setSource] = useState<Load<FileContent> | null>(
     showsSource ? { state: "loading" } : null,
   );
+  const [purpose, setPurpose] = useState<Load<Explanation>>({ state: "loading" });
 
   async function openNode(id: number) {
     if (!onSelectNode) return;
@@ -232,6 +373,18 @@ export function Inspector({
     getSymbol(repoId, nodeId, commitSha).then(
       (value) => !cancelled && setFacts({ state: "loaded", value }),
       (err) => !cancelled && setFacts(errorState(err)),
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [repoId, commitSha, nodeId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (nodeId === null) return;
+    getNodeExplanation(repoId, nodeId, commitSha).then(
+      (value) => !cancelled && setPurpose({ state: "loaded", value }),
+      (err) => !cancelled && setPurpose(errorState(err)),
     );
     return () => {
       cancelled = true;
@@ -284,6 +437,12 @@ export function Inspector({
       </header>
 
       <div className="space-y-5">
+        <Section title="Purpose">
+          <PurposeSection load={purpose} />
+        </Section>
+      </div>
+
+      <div className="space-y-5">
         <h2 className="text-sm font-semibold">Mechanics</h2>
 
         {showsSource && (
@@ -299,6 +458,7 @@ export function Inspector({
               <>
                 <SourceView
                   key={`${n.id}`}
+                  path={source.value.path}
                   content={source.value.content}
                   from={n.kind === "symbol" ? n.line_start : null}
                   to={n.kind === "symbol" ? n.line_end : null}

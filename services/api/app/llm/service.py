@@ -25,7 +25,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
@@ -36,6 +36,7 @@ from app.llm.routing import (
     attempt_models,
     resolve_route,
 )
+from app.llm.tokens import estimate_tokens
 from app.models import LlmCall, LlmCallStatus, LlmOperation, ModelRole
 
 T = TypeVar("T", bound=BaseModel)
@@ -94,6 +95,35 @@ class Completion:
     request_id: str | None = None
 
 
+# `document` for the corpus side, `query` for a search string. Voyage (and
+# every other asymmetric code embedder) prepends a different fixed instruction
+# per side, so indexing and searching must not use the same value.
+EmbeddingInputType = Literal["document", "query"]
+
+
+@dataclass(frozen=True)
+class EmbeddingRequest:
+    """One embedding request to one vendor: already batched and already
+    checked against the route's per-request limits."""
+
+    model: str
+    texts: tuple[str, ...]
+    input_type: EmbeddingInputType | None = None
+    dimensions: int | None = None
+
+
+@dataclass(frozen=True)
+class EmbeddingResponse:
+    # One vector per input text, in input order. The provider is responsible
+    # for restoring input order; the service verifies the count.
+    vectors: list[list[float]]
+    served_model: str | None = None
+    # The provider's own measured token count for this request -- the number
+    # cost is billed on, unlike the chunker's estimate.
+    input_tokens: int = 0
+    request_id: str | None = None
+
+
 # --- errors -----------------------------------------------------------------
 
 
@@ -111,6 +141,20 @@ class ModelRefusalError(ModelServiceError):
 
 class ModelOutputTruncatedError(ModelServiceError):
     """The provider stopped at max_tokens; the output is incomplete."""
+
+
+class EmbeddingNotConfiguredError(ModelServiceError):
+    """No embedding provider is wired (e.g. VOYAGE_API_KEY is unset).
+
+    Callers that can usefully continue without vectors -- the chunk pass
+    stores chunks with `embedding = NULL` and FTS still works -- catch this
+    and record the gap. Nothing silently substitutes a fake vector."""
+
+
+class EmbeddingShapeError(ModelServiceError):
+    """The provider returned the wrong number of vectors, or a vector of the
+    wrong dimension. Fails the call: a short or mis-sized result would mean
+    silently dropping or mis-assigning texts."""
 
 
 @dataclass
@@ -141,6 +185,16 @@ class CompletionProvider(ABC):
         """Raise any exception on transport/API failure; return on any response."""
 
 
+class EmbeddingProvider(ABC):
+    """One embedding request to one vendor. No routing, batching, or recording."""
+
+    name: str
+
+    @abstractmethod
+    def embed(self, request: EmbeddingRequest) -> EmbeddingResponse:
+        """Raise any exception on transport/API failure; return on any response."""
+
+
 class ModelService(ABC):
     """Provider-independent model interface. Callers address roles, not models."""
 
@@ -165,7 +219,14 @@ class ModelService(ABC):
     ) -> str: ...
 
     @abstractmethod
-    def embed(self, texts: Sequence[str], model_role: ModelRole = "embed") -> list[list[float]]: ...
+    def embed(
+        self,
+        texts: Sequence[str],
+        model_role: ModelRole = "embed",
+        *,
+        input_type: EmbeddingInputType | None = "document",
+        context: CallContext | None = None,
+    ) -> list[list[float]]: ...
 
     @abstractmethod
     def rerank(
@@ -203,11 +264,17 @@ class RoutedModelService(ModelService):
         recorder: UsageRecorder,
         routes: dict[ModelRole, ModelRoute] | None = None,
         clock: Callable[[], float] = time.perf_counter,
+        embedding_provider: EmbeddingProvider | None = None,
     ) -> None:
         self._provider = provider
         self._recorder = recorder
         self._routes = dict(DEFAULT_ROUTES if routes is None else routes)
         self._clock = clock
+        # None is a supported configuration: with no embedding credentials the
+        # chunk pass still runs and stores chunks with no vector (Part 4.D's
+        # "embeddings are a pluggable stage"). `embed` then raises
+        # EmbeddingNotConfiguredError instead of inventing a provider.
+        self._embedding_provider = embedding_provider
 
     # -- public API --
 
@@ -279,12 +346,121 @@ class RoutedModelService(ModelService):
         )
         return completion.text
 
-    def embed(self, texts: Sequence[str], model_role: ModelRole = "embed") -> list[list[float]]:
-        # STUB(CodeAxis): embedding model is an open decision (build-plan.md Part 13 #2,
-        # hosted vs. self-hosted). Wire a provider here once it is decided.
-        raise NotImplementedError(
-            "ModelService.embed is not implemented: the embedding model is an open "
-            "decision (build-plan.md Part 13 #2). No provider is wired."
+    def embed(
+        self,
+        texts: Sequence[str],
+        model_role: ModelRole = "embed",
+        *,
+        input_type: EmbeddingInputType | None = "document",
+        context: CallContext | None = None,
+    ) -> list[list[float]]:
+        """One vector per text, in input order.
+
+        Batched to stay under the route's per-request caps, with one
+        `llm_calls` row (role `embed`, operation `embed`) per provider
+        request. Every failure mode is loud: no provider configured, a text
+        longer than the model's context, a transport error, or a response
+        whose shape does not match what was sent. Nothing is ever silently
+        dropped or truncated.
+        """
+        if not texts:
+            return []  # nothing was sent, so there is nothing to record
+        if self._embedding_provider is None:
+            raise EmbeddingNotConfiguredError(
+                "no embedding provider is configured (VOYAGE_API_KEY unset?); "
+                "chunks can still be stored and searched by FTS without vectors"
+            )
+        route = resolve_route(self._routes, model_role)
+        token_estimates = [estimate_tokens(text) for text in texts]
+        for index, (text, tokens) in enumerate(zip(texts, token_estimates, strict=True)):
+            if not text.strip():
+                raise ModelServiceError(f"text {index} is empty; refusing to embed it")
+            if route.max_input_tokens is not None and tokens > route.max_input_tokens:
+                raise ModelServiceError(
+                    f"text {index} is ~{tokens} tokens, over {route.model}'s "
+                    f"{route.max_input_tokens}-token context; split it before embedding"
+                )
+
+        vectors: list[list[float]] = []
+        for batch in _batch_indices(token_estimates, route):
+            request = EmbeddingRequest(
+                model=route.model,
+                texts=tuple(texts[i] for i in batch),
+                input_type=input_type,
+                dimensions=route.dimensions,
+            )
+            vectors.extend(self._embed_once(request, model_role, route, context))
+        return vectors
+
+    def _embed_once(
+        self,
+        request: EmbeddingRequest,
+        role: ModelRole,
+        route: ModelRoute,
+        context: CallContext | None,
+    ) -> list[list[float]]:
+        """One provider request: timed, recorded, shape-checked."""
+        assert self._embedding_provider is not None
+        started = self._clock()
+        try:
+            response = self._embedding_provider.embed(request)
+        except Exception as exc:
+            message = f"{type(exc).__name__}: {exc}"[:2000]
+            self._record_embed(
+                request, role, "error", self._elapsed_ms(started),
+                response=None, error=message, context=context,
+            )
+            raise ModelCallError(message) from exc
+
+        latency_ms = self._elapsed_ms(started)
+        shape_error = _embedding_shape_error(response, request, route)
+        self._record_embed(
+            request, role, "error" if shape_error else "succeeded", latency_ms,
+            response=response, error=shape_error, context=context,
+        )
+        if shape_error:
+            raise EmbeddingShapeError(shape_error)
+        return response.vectors
+
+    def _record_embed(
+        self,
+        request: EmbeddingRequest,
+        role: ModelRole,
+        status: LlmCallStatus,
+        latency_ms: int,
+        *,
+        response: EmbeddingResponse | None,
+        error: str | None,
+        context: CallContext | None,
+    ) -> None:
+        """Same rule as completions: an unrecorded model call is a bug, so a
+        recorder failure fails the call rather than being swallowed."""
+        assert self._embedding_provider is not None
+        input_tokens = response.input_tokens if response else 0
+        served_model = response.served_model if response else None
+        self._recorder(
+            LlmCall(
+                role=role,
+                provider=self._embedding_provider.name,
+                model=request.model,
+                served_model=served_model,
+                operation="embed",
+                attempt=1,  # embeddings are not retried here; the caller decides
+                status=status,
+                input_tokens=input_tokens,
+                output_tokens=0,
+                cost_usd=estimate_cost_usd(
+                    served_model or request.model,
+                    input_tokens=input_tokens,
+                    output_tokens=0,
+                ),
+                latency_ms=latency_ms,
+                request_id=response.request_id if response else None,
+                error=error,
+                project_id=context.project_id if context else None,
+                repo_id=context.repo_id if context else None,
+                job_id=context.job_id if context else None,
+            )
         )
 
     def rerank(
@@ -396,3 +572,64 @@ class RoutedModelService(ModelService):
                 job_id=context.job_id if context else None,
             )
         )
+
+
+# --- embedding batching -------------------------------------------------------
+
+# Fraction of the provider's hard per-request token cap we actually fill.
+# `estimate_tokens` can under-count and an over-cap request is rejected
+# outright, so this slack is what keeps a bad estimate from failing a batch.
+_BATCH_TOKEN_HEADROOM = 0.8
+
+
+def _batch_indices(token_estimates: list[int], route: ModelRoute) -> list[list[int]]:
+    """Greedy packing of text indices into provider requests, in input order.
+
+    Honours both of the route's caps. A single text that alone exceeds the
+    token budget still gets its own batch -- it was already checked against
+    the per-text context limit, so sending it is correct, and the headroom
+    above is what absorbs the estimate error.
+    """
+    max_texts = route.max_batch_texts or len(token_estimates)
+    token_budget = (
+        int(route.max_batch_tokens * _BATCH_TOKEN_HEADROOM) if route.max_batch_tokens else None
+    )
+    batches: list[list[int]] = []
+    current: list[int] = []
+    current_tokens = 0
+    for index, tokens in enumerate(token_estimates):
+        over_texts = len(current) >= max_texts
+        over_tokens = (
+            token_budget is not None and bool(current) and current_tokens + tokens > token_budget
+        )
+        if over_texts or over_tokens:
+            batches.append(current)
+            current, current_tokens = [], 0
+        current.append(index)
+        current_tokens += tokens
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _embedding_shape_error(
+    response: EmbeddingResponse, request: EmbeddingRequest, route: ModelRoute
+) -> str | None:
+    """Why this response cannot be trusted, or None if it can."""
+    if len(response.vectors) != len(request.texts):
+        return (
+            f"{request.model} returned {len(response.vectors)} vectors for "
+            f"{len(request.texts)} texts"
+        )
+    expected = route.dimensions
+    if expected is not None:
+        wrong = [
+            (i, len(vector)) for i, vector in enumerate(response.vectors) if len(vector) != expected
+        ]
+        if wrong:
+            index, got = wrong[0]
+            return (
+                f"{request.model} returned a {got}-dimension vector at index {index}; "
+                f"the route (and the chunks.embedding column) expect {expected}"
+            )
+    return None

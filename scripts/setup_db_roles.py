@@ -24,20 +24,27 @@ project_ref = os.environ.get("SUPABASE_URL", "").removeprefix("https://").split(
 pooler_host_db = url.split("@", 1)[1] if "@" in url else None
 
 GRANTS = {
-    "codeaxis_worker": """
+    "codeaxis_worker": sql.SQL(
+        """
         grant usage on schema codeaxis to codeaxis_worker;
         grant usage on schema extensions to codeaxis_worker;
-        grant select, insert, update, delete on all tables in schema codeaxis to codeaxis_worker;
+        grant select, insert, update, delete on all tables in schema codeaxis
+            to codeaxis_worker;
         grant usage, select on all sequences in schema codeaxis to codeaxis_worker;
-        alter default privileges in schema codeaxis grant select, insert, update, delete on tables to codeaxis_worker;
-        alter default privileges in schema codeaxis grant usage, select on sequences to codeaxis_worker;
-    """,
-    "codeaxis_api": """
+        alter default privileges in schema codeaxis
+            grant select, insert, update, delete on tables to codeaxis_worker;
+        alter default privileges in schema codeaxis
+            grant usage, select on sequences to codeaxis_worker;
+        """
+    ),
+    "codeaxis_api": sql.SQL(
+        """
         grant usage on schema codeaxis to codeaxis_api;
         grant usage on schema extensions to codeaxis_api;
         grant select on all tables in schema codeaxis to codeaxis_api;
         alter default privileges in schema codeaxis grant select on tables to codeaxis_api;
-    """,
+        """
+    ),
 }
 
 with psycopg.connect(url, connect_timeout=10, autocommit=True) as conn:

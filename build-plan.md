@@ -100,7 +100,7 @@ All three features read the same model. No feature gets its own private analyzer
 | DB access | **SQLAlchemy 2.0 (async)**; **schema owned by Supabase SQL migrations** | One migration system only (Supabase CLI). Do not also run Alembic |
 | Auth | **Supabase Auth** (email + GitHub OAuth) | FastAPI verifies the Supabase JWT |
 | Authorization | App-layer project membership checks **and** RLS | FastAPI connects with elevated DB access, which bypasses RLS — so app-layer checks are mandatory, RLS protects direct browser reads |
-| Storage | Supabase Storage (snapshots, uploads, exports) | Signed URLs |
+| Storage | **Postgres** (`codeaxis.blobs`, per-file text keyed by content hash) | Decided 2026-10-17: Supabase Storage was never built; per-file blobs-in-Postgres shipped in Phase 1 and is canonical going forward — see `docs/STATUS.md`. Revisit only if blob volume/size makes Postgres storage impractical |
 | Queue | **Supabase Queues (pgmq)** to start; Redis + Arq/Celery only if needed | |
 | Realtime | Supabase Realtime for job progress | |
 | Containers | **Docker** (dev + deploy); workers on Fly.io / Railway / Cloud Run; web on Vercel | |
@@ -138,7 +138,7 @@ All three features read the same model. No feature gets its own private analyzer
 3. Resolve commit SHA / content hash → create **snapshot**.
 4. Detect language, framework, package manager. Exclude vendored/generated/build output/binaries/oversized files (configurable).
 5. Secret scan + redaction.
-6. Store tarball in Storage; write file manifest with content hashes.
+6. Store each included file's content in `codeaxis.blobs`, keyed by content hash (not a tarball in Storage — see Part 2's Storage row); write file manifest with content hashes.
 Limits (configurable): e.g. ≤500 MB raw, ≤20k source files. Clear failure messages beyond that.
 
 ### B. Structural + relationship extraction (deterministic)

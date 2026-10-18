@@ -4,18 +4,40 @@ import Link from "next/link";
 import { useParams, useSearchParams } from "next/navigation";
 import { useState } from "react";
 
+import { AskView } from "@/components/AskView";
 import { CoverageView } from "@/components/CoverageView";
 import { Explorer } from "@/components/Explorer";
 import { Inspector } from "@/components/Inspector";
-import type { GraphNode } from "@/lib/api";
+import { getSymbol, type Citation, type GraphNode } from "@/lib/api";
 
-type Tab = "explore" | "coverage";
+type Tab = "explore" | "ask" | "coverage";
+
+const TAB_LABELS: Record<Tab, string> = {
+  explore: "Explore",
+  ask: "Ask",
+  coverage: "Coverage",
+};
 
 export function Workspace() {
   const { id } = useParams<{ id: string }>();
   const commitSha = useSearchParams().get("commit_sha");
   const [selected, setSelected] = useState<GraphNode | null>(null);
   const [tab, setTab] = useState<Tab>("explore");
+
+  // A citation in an answer selects the node it points at and hands the user
+  // back to the Explorer/Inspector pair — one model, reached from a second
+  // surface, rather than a second rendering of the same facts.
+  async function openCitation(citation: Citation) {
+    if (!commitSha || citation.node_id === null || citation.node_id === undefined) return;
+    try {
+      const detail = await getSymbol(id, citation.node_id, commitSha);
+      setSelected(detail);
+      setTab("explore");
+    } catch {
+      // The citation resolved server-side but this fetch failed: stay put
+      // rather than replacing the answer with an error.
+    }
+  }
 
   if (!commitSha) {
     return (
@@ -39,7 +61,7 @@ export function Workspace() {
           <span>Pass 1: files and symbol definitions. Nothing was executed.</span>
         </div>
         <div className="flex gap-1" role="tablist" aria-label="Workspace view">
-          {(["explore", "coverage"] as const).map((t) => (
+          {(["explore", "ask", "coverage"] as const).map((t) => (
             <button
               key={t}
               type="button"
@@ -50,7 +72,7 @@ export function Workspace() {
                 tab === t ? "bg-accent/15 text-foreground" : "text-muted hover:bg-panel"
               }`}
             >
-              {t === "explore" ? "Explore" : "Coverage"}
+              {TAB_LABELS[t]}
             </button>
           ))}
         </div>
@@ -58,6 +80,10 @@ export function Workspace() {
       {tab === "coverage" ? (
         <section aria-label="Coverage" className="min-h-0 flex-1 overflow-auto">
           <CoverageView repoId={id} commitSha={commitSha} />
+        </section>
+      ) : tab === "ask" ? (
+        <section aria-label="Ask this codebase" className="min-h-0 flex-1 overflow-auto">
+          <AskView repoId={id} commitSha={commitSha} onOpenCitation={openCitation} />
         </section>
       ) : (
         <div className="flex min-h-0 flex-1 flex-col md:flex-row">

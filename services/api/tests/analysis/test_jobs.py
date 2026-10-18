@@ -42,7 +42,9 @@ def test_run_scan_pass_populates_graph(tmp_path, db_project):
 
         with worker_connection() as conn:
             runs = list_pass_runs(conn, repo.id)
-            assert len(runs) == 1
+            # list_pass_runs orders by started_at, so runs[0] is the scan
+            # pass. Later passes (chunking, summaries) add their own rows.
+            assert runs, "expected at least one pass run"
             assert runs[0].status == PassRunStatus.SUCCEEDED
 
             root = get_root_node(conn, repo.id, commit_sha)
@@ -105,7 +107,7 @@ def _edges(conn, repo_id, commit_sha, kind=None) -> list[Edge]:
     query = (
         "select id, repo_id, commit_sha, kind, src_id, dst_id, line_start, line_end, "
         "col_start, col_end, analyzer, analyzer_version, status, source_file, "
-        "confidence, reason, resolution_status, attrs from codeaxis.edges where "
+        "confidence, reason, resolution_status, attrs, origin from codeaxis.edges where "
         + " and ".join(clauses)
     )
     with conn.cursor(row_factory=class_row(Edge)) as cur:
@@ -175,17 +177,19 @@ def test_run_scan_pass_produces_clusters_and_layers(tmp_path, db_project):
 
         with worker_connection() as conn:
             runs = list_pass_runs(conn, repo.id)
-            assert len(runs) == 1
+            # list_pass_runs orders by started_at, so runs[0] is the scan
+            # pass. Later passes (chunking, summaries) add their own rows.
+            assert runs, "expected at least one pass run"
             assert runs[0].status == PassRunStatus.SUCCEEDED
 
             cluster_nodes: list[Node] = list_nodes(conn, repo.id, commit_sha, kind="cluster")
             assert cluster_nodes, "expected at least one cluster node"
-            assert all(n.attrs.get("origin") == "inferred" for n in cluster_nodes)
+            assert all(n.origin == "inferred" for n in cluster_nodes)
 
             belongs_to_edges = _edges(conn, repo.id, commit_sha, kind="belongs_to")
             assert belongs_to_edges, "expected at least one belongs_to edge"
             assert all(e.status == "verified" for e in belongs_to_edges)
-            assert all(e.attrs.get("origin") == "inferred" for e in belongs_to_edges)
+            assert all(e.origin == "inferred" for e in belongs_to_edges)
 
             users_node = list_nodes(
                 conn, repo.id, commit_sha, kind="file", path="app/routes/users.py"

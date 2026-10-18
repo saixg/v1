@@ -14,6 +14,7 @@ from app.models import ModelRole
 HAIKU = "claude-haiku-5-5"
 SONNET = "claude-sonnet-5-5"
 OPUS = "claude-opus-5-5"
+VOYAGE_CODE_3 = "voyage-code-3"
 
 
 @dataclass(frozen=True)
@@ -24,15 +25,40 @@ class ModelRoute:
     escalation_model: str | None = None
     max_tokens: int = 16000  # non-streaming ceiling; keeps requests under SDK HTTP timeouts
     accepts_images: bool = False
+    # --- embedding roles only (None on every completion role) ---------------
+    # Output vector size. Must match the `chunks.embedding` column's declared
+    # dimension, or every insert fails: changing it is a migration, not a
+    # config tweak.
+    dimensions: int | None = None
+    # The provider's hard per-request caps. RoutedModelService.embed batches
+    # to stay under both and fails visibly rather than dropping texts.
+    max_batch_texts: int | None = None
+    max_batch_tokens: int | None = None
+    # Per-text context length. A longer text is rejected, never truncated.
+    max_input_tokens: int | None = None
 
 
-# embed and rerank are absent on purpose: the embedding model is an open
-# decision (Part 13 #2) and reranking ships only if eval says it's needed.
+# `embed` is hosted voyage-code-3: Part 13 #2 was settled by the owner on
+# 2026-10-17 (hosted, not self-hosted) and 1024 dimensions is what the
+# `chunks.embedding` column in supabase/migrations/20261019000000_semantic.sql
+# declares. `rerank` is still absent on purpose: it ships only if eval shows
+# retrieval is insufficient (Part 3).
 DEFAULT_ROUTES: dict[ModelRole, ModelRoute] = {
     "bulk": ModelRoute(model=HAIKU, max_tokens=4096),
     "synth": ModelRoute(model=SONNET),
     "design": ModelRoute(model=SONNET, escalation_model=OPUS),
     "vision": ModelRoute(model=SONNET, accepts_images=True),
+    "embed": ModelRoute(
+        model=VOYAGE_CODE_3,
+        # Embeddings have no output-token budget; this field is unused here.
+        max_tokens=0,
+        dimensions=1024,
+        # voyage-code-3 per-request limits, docs.voyageai.com (read 2026-10-17):
+        # at most 1,000 texts and 120K tokens per request, 32K tokens per text.
+        max_batch_texts=1000,
+        max_batch_tokens=120_000,
+        max_input_tokens=32_000,
+    ),
 }
 
 

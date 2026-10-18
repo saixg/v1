@@ -56,6 +56,8 @@ from .scan import (
     list_included_files,
     scan_repo,
 )
+from .semantic.chunk_writer import write_chunk_pass
+from .semantic.writer import write_semantic_pass
 
 logger = logging.getLogger(__name__)
 
@@ -275,9 +277,31 @@ def _run_scan_pass(
             # rather than becoming its own PassRun (see writer.py's
             # module docstring for the reasoning).
             write_architecture_pass(conn, repo_id, commit_sha)
+
+            # --- Pass 2a: chunk + embed (build-plan.md Part 4.D) -----------
+            # AST-aware chunks over the blobs and symbol nodes written above,
+            # plus embeddings when an embedding key is configured. Takes its
+            # own pass_run (it is the first pass that can call an external
+            # API); a missing/failing embedding provider is recorded as a
+            # coverage blocker, not a scan failure -- see
+            # app/analysis/semantic/chunk_writer.py's module docstring.
+            write_chunk_pass(conn, repo_id, commit_sha)
+            # --- end Pass 2a ------------------------------------------------
         except Exception as exc:
             conn.rollback()
             finish_pass_run(conn, run.id, PassRunStatus.FAILED, error=str(exc))
             raise
 
         finish_pass_run(conn, run.id, PassRunStatus.SUCCEEDED)
+
+        # --- Pass 2b: summaries + conventions (build-plan.md Part 4.D) ------
+        # Appended after the scan pass_run has already been closed as
+        # succeeded, on purpose: this is the first pass whose output is model
+        # prose rather than parsed fact, and it must never be able to turn a
+        # good graph into a failed scan. `write_semantic_pass` owns its own
+        # pass_run, records every outcome there (including "skipped: no model
+        # provider configured") and never raises -- see
+        # app/analysis/semantic/writer.py.
+        write_semantic_pass(conn, repo_id, commit_sha)
+        # --- end Pass 2b ----------------------------------------------------
+

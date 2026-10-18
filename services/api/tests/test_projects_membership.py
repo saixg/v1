@@ -147,9 +147,15 @@ def test_member_scan_job_lifecycle_and_non_member_is_blocked(
     assert job["error"] is None
     assert job["updated_at"] >= job["created_at"]
 
-    # The job's outcome agrees with the analyzer-level pass_run.
+    # The job's outcome agrees with the analyzer-level pass_run. The scan is
+    # the first run; the semantic pass appends its own run and, with no model
+    # key configured in tests, records an honest `skipped:` failure.
     runs = client.get(f"/repos/{repo_id}/status", headers=a).json()["runs"]
-    assert [r["status"] for r in runs] == ["succeeded"]
+    scan = runs[0]
+    assert scan["analyzer"] == "tree-sitter", runs
+    assert scan["status"] == "succeeded", runs
+    for run in runs[1:]:
+        assert run["analyzer"].startswith("semantic"), runs
 
     # Members read the graph; Bob still can't, nor can he read the job.
     assert client.get(f"/repos/{repo_id}/tree-root", params=commit, headers=a).status_code == 200

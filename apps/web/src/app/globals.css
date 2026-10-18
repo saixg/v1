@@ -36,3 +36,10 @@ body {
   color: var(--foreground);
   font-family: var(--font-sans);
 }
+
+/* Monaco decoration for a symbol's source span inside the full file,
+   applied via editor.createDecorationsCollection in Inspector.tsx. */
+.codeaxis-symbol-span-line {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+

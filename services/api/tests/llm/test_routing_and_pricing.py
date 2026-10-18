@@ -18,12 +18,25 @@ def test_routing_table_matches_part_3():
     assert [r for r, v in DEFAULT_ROUTES.items() if v.accepts_images] == ["vision"]
 
 
-def test_embed_and_rerank_are_not_routed():
-    # Part 13 #2 leaves the embedding model open; don't guess one.
-    for role in ("embed", "rerank"):
-        assert role not in DEFAULT_ROUTES
-        with pytest.raises(UnroutedRoleError):
-            resolve_route(DEFAULT_ROUTES, role)
+def test_embed_is_routed_to_voyage_code_3():
+    # Part 13 #2 settled 2026-10-17: hosted voyage-code-3, 1024 dimensions,
+    # which must match the chunks.embedding column in the semantic migration.
+    route = DEFAULT_ROUTES["embed"]
+    assert route.model == "voyage-code-3"
+    assert route.dimensions == 1024
+    assert (route.max_batch_texts, route.max_batch_tokens) == (1000, 120_000)
+    assert route.max_input_tokens == 32_000
+
+
+def test_rerank_is_not_routed():
+    # Reranking ships only if the eval harness shows retrieval is insufficient.
+    assert "rerank" not in DEFAULT_ROUTES
+    with pytest.raises(UnroutedRoleError):
+        resolve_route(DEFAULT_ROUTES, "rerank")
+
+
+def test_only_embed_carries_embedding_limits():
+    assert [r for r, v in DEFAULT_ROUTES.items() if v.dimensions is not None] == ["embed"]
 
 
 def test_attempt_models():
@@ -67,6 +80,12 @@ def test_cache_tokens_priced():
         cache_creation_input_tokens=10**6,
     )
     assert cost == pytest.approx(0.20 + 2.50)
+
+
+def test_voyage_code_3_price():
+    # $0.18 / MTok, input only (docs.voyageai.com/docs/pricing, 2026-10-17).
+    assert estimate_cost_usd("voyage-code-3", input_tokens=10**6, output_tokens=0) == 0.18
+    assert estimate_cost_usd("voyage-code-3", input_tokens=12_500, output_tokens=0) == 0.00225
 
 
 def test_unknown_model_is_not_priced():

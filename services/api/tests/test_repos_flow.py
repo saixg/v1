@@ -35,14 +35,20 @@ def member(client, make_user, auth_header) -> tuple[TestClient, str]:
     return TestClient(app, headers=headers), resp.json()["id"]
 
 
-def _row_counts() -> dict[str, int]:
+def _assert_no_rows_for(repo_ids: list[str]) -> None:
+    """Confirm cleanup actually removed every row these specific repos
+    touched. Scoped by repo_id rather than a whole-table count snapshot,
+    so it stays correct under concurrent DB writers (other tests, other
+    processes) instead of racing on unrelated rows."""
     with worker_connection() as conn, conn.cursor() as cur:
-        counts = {}
-        for table in TABLES:
-            row = cur.execute(f"select count(*) from codeaxis.{table}").fetchone()
-            assert row is not None
-            counts[table] = row[0]
-        return counts
+        for repo_id in repo_ids:
+            for table in TABLES:
+                col = "id" if table == "repos" else "repo_id"
+                row = cur.execute(
+                    f"select count(*) from codeaxis.{table} where {col} = %s", (repo_id,)
+                ).fetchone()
+                assert row is not None
+                assert row[0] == 0, f"{table} still has rows for repo {repo_id}"
 
 
 def _cleanup(repo_ids: list[str]) -> None:
@@ -73,7 +79,6 @@ def test_stage_confirm_scan_and_browse(tmp_path, member):
 
     client, project_id = member
     commit_sha = "deadbeef"
-    before = _row_counts()
     repo_ids: list[str] = []
 
     try:
@@ -182,7 +187,7 @@ def test_stage_confirm_scan_and_browse(tmp_path, member):
     finally:
         _cleanup(repo_ids)
 
-    assert _row_counts() == before
+    _assert_no_rows_for(repo_ids)
 
 
 def test_upload_zip_stage_confirm_and_cleanup(member):
@@ -192,7 +197,6 @@ def test_upload_zip_stage_confirm_and_cleanup(member):
     payload = buf.getvalue()
 
     client, project_id = member
-    before = _row_counts()
     repo_ids: list[str] = []
 
     try:
@@ -227,7 +231,7 @@ def test_upload_zip_stage_confirm_and_cleanup(member):
     finally:
         _cleanup(repo_ids)
 
-    assert _row_counts() == before
+    _assert_no_rows_for(repo_ids)
 
 
 def test_coverage_and_symbol_relationships(tmp_path, member):
@@ -239,7 +243,6 @@ def test_coverage_and_symbol_relationships(tmp_path, member):
 
     client, project_id = member
     commit_sha = "coverage-test"
-    before = _row_counts()
     repo_ids: list[str] = []
 
     try:
@@ -299,12 +302,11 @@ def test_coverage_and_symbol_relationships(tmp_path, member):
     finally:
         _cleanup(repo_ids)
 
-    assert _row_counts() == before
+    _assert_no_rows_for(repo_ids)
 
 
 def test_stage_rejects_bad_sources(tmp_path, member):
     client, project_id = member
-    before = _row_counts()
 
     missing = client.post(
         "/repos/stage",
@@ -330,5 +332,3 @@ def test_stage_rejects_bad_sources(tmp_path, member):
 
     unknown = client.post("/repos/00000000-0000-0000-0000-000000000000/confirm", json={})
     assert unknown.status_code == 404
-
-    assert _row_counts() == before

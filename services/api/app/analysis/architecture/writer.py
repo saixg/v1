@@ -44,10 +44,16 @@ def write_architecture_pass(conn: psycopg.Connection, repo_id: str, commit_sha: 
                 commit_sha=commit_sha,
                 kind="cluster",
                 name=f"cluster-{label}",
-                attrs={"origin": "inferred", "member_count": len(members)},
+                attrs={"member_count": len(members)},
                 analyzer=ANALYZER,
                 analyzer_version=ANALYZER_VERSION,
                 status="inferred",
+                # A cluster is an algorithmic grouping, not something read
+                # out of source: the `origin` column says so. It used to be
+                # duplicated in attrs["origin"]; the column is authoritative
+                # now (build-plan.md Part 4.C / Part 5) and attrs no longer
+                # carries a second copy.
+                origin="inferred",
             )
             for label, members in sorted(members_by_cluster.items())
         ]
@@ -70,9 +76,9 @@ def write_architecture_pass(conn: psycopg.Connection, repo_id: str, commit_sha: 
                 # -- that's a verified fact about the algorithm's output.
                 # Whether the resulting *architectural* grouping is correct
                 # is a separate question, carried by attrs["origin"] below,
-                # not by this field.
+                # not by this field -- see the `origin` column below.
                 status="verified",
-                attrs={"origin": "inferred"},
+                origin="inferred",
             )
             for label, members in members_by_cluster.items()
             for member_id in members
@@ -93,4 +99,13 @@ def write_architecture_pass(conn: psycopg.Connection, repo_id: str, commit_sha: 
         layer = classify_layer(path)
         if layer is None:
             continue
+        # `layer_origin` is deliberately *not* folded into the node's
+        # `origin` column and is not a duplicate of it. The column states
+        # where the node record itself came from (a file node is `parsed`:
+        # the scanner read it off disk). `layer_origin` states where this
+        # one *attribute* came from -- Part 4.C's "every architectural
+        # statement is tagged by origin" is per statement, and a single file
+        # node can carry a parsed record with, say, an inferred layer once
+        # the LLM fallback exists. It uses the same vocabulary
+        # (parsed|configured|inferred) on purpose.
         update_node_attrs(conn, node_id, {"layer": layer, "layer_origin": "parsed"})

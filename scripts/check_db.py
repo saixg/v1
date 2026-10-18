@@ -13,7 +13,8 @@ if not url:
     sys.exit("DATABASE_URL is not set. Copy .env.example to .env and fill it in.")
 
 with psycopg.connect(url, connect_timeout=10) as conn:
-    print("server:", conn.execute("show server_version").fetchone()[0])
+    version_row = conn.execute("show server_version").fetchone()
+    print("server:", version_row[0] if version_row else "unknown")
     rows = conn.execute(
         "select name, default_version, installed_version from pg_available_extensions"
         " where name in ('vector', 'pgmq') order by name"

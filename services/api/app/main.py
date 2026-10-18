@@ -16,8 +16,19 @@ from __future__ import annotations
 import os
 import tempfile
 from pathlib import Path
+from typing import Annotated
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response, UploadFile
+import psycopg
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+)
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -31,6 +42,15 @@ from app.analysis.jobs import (
     stage_zip_repo,
 )
 from app.analysis.scan import PreviewEntry
+from app.analysis.semantic.chat import STREAMING_GAP, narrate
+from app.analysis.semantic.retrieve import (
+    DEFAULT_LIMIT,
+    DEFAULT_TOKEN_BUDGET,
+    ModelServiceEmbedder,
+    RetrievalQuery,
+    RetrievalResult,
+    retrieve,
+)
 from app.auth import (
     CurrentUser,
     RepoAccess,
@@ -49,6 +69,9 @@ from app.knowledge import (
     get_membership_role,
     get_node,
     get_root_node,
+    # Component Inspector explanations (build-plan.md Part 7).
+    get_summary,
+    get_summary_for_node,
     list_children,
     list_coverage,
     list_pass_runs,
@@ -58,8 +81,21 @@ from app.knowledge import (
     worker_connection,
 )
 from app.knowledge.reads import MAX_GRAPH_DEPTH
+from app.knowledge.retrieval import (
+    create_chat_thread,
+    get_chat_thread,
+    insert_chat_message,
+    list_chat_messages,
+)
+from app.llm import (
+    CallContext,
+    ModelService,
+    ModelServiceError,
+    StructuredOutputError,
+    anthropic_model_service,
+)
 from app.logging import RequestLoggingMiddleware, configure_logging
-from app.models import IngestSource, Job, ProjectWithRole, Repo
+from app.models import ChatMessage, ChatThread, IngestSource, Job, ProjectWithRole, Repo
 from app.repository.ingest import ZIP_LIMITS, IngestError, MaterializedCheckout
 
 configure_logging()
@@ -436,3 +472,412 @@ def file_content(repo: RepoAccess, path: str, commit_sha: str) -> dict:
             "unreadable or binary when scanned, or has not been scanned yet",
         )
     return {"path": blob.path, "content": blob.content, "content_hash": blob.content_hash}
+
+
+# ------------------------------------------------- search + grounded chat
+#
+# build-plan.md Part 4.E / Part 8. Paths follow this app's existing `/repos/
+# {repo_id}/...` convention rather than Part 8's literal `/repositories/...`:
+# every route already shipped uses `/repos`, and one endpoint spelled
+# differently would be a worse contradiction than the shorthand.
+#
+# Both routes take the `RepoAccess` dependency (401 without a valid Clerk
+# token, 404 unknown repo, 403 non-member) and a required `commit_sha`, the
+# same way every other read route in this file does.
+
+
+def get_model_service() -> ModelService:
+    """The ModelService the chat route narrates with. A FastAPI dependency so
+    tests override it with a scripted provider — no API key is used or needed
+    anywhere in the test suite."""
+    return anthropic_model_service()
+
+
+def _query_embedder() -> ModelServiceEmbedder:
+    """The vector stage's embedder. Built from the same ModelService; when
+    `embed` is unwired or unkeyed, the stage degrades to skipped and FTS +
+    exact-symbol + graph expansion answer on their own."""
+    return ModelServiceEmbedder(anthropic_model_service())
+
+
+def _retrieval_query(
+    q: str,
+    limit: int,
+    token_budget: int,
+    hops: int,
+    vector: bool,
+    path_prefix: list[str] | None,
+    kind: list[str] | None,
+) -> RetrievalQuery:
+    return RetrievalQuery(
+        text=q,
+        path_prefixes=tuple(path_prefix or ()),
+        kinds=tuple(kind or ()),
+        limit=limit,
+        token_budget=token_budget,
+        hops=hops,
+        use_vector=vector,
+    )
+
+
+def _semantic_index_required() -> HTTPException:
+    return HTTPException(
+        503,
+        "the semantic index is not available for this deployment: the chunks/chat "
+        "tables from supabase/migrations/20261019000000_semantic.sql are not applied",
+    )
+
+
+def _budget_payload(result: RetrievalResult) -> dict:
+    return {
+        "token_budget": result.token_budget,
+        "tokens_used": result.tokens_used,
+        "dropped_for_budget": result.dropped_for_budget,
+        "fused_candidates": result.fused_candidates,
+    }
+
+
+def _result_payload(result: RetrievalResult, *, include_content: bool) -> list[dict]:
+    items = []
+    for item in result.items:
+        chunk = item.chunk
+        row: dict = {
+            "chunk_id": chunk.id,
+            "node_id": chunk.node_id,
+            "path": chunk.path,
+            "symbol": chunk.symbol,
+            "kind": chunk.kind,
+            "line_start": chunk.line_start,
+            "line_end": chunk.line_end,
+            "token_count": chunk.token_count,
+            "score": item.score,
+            "stages": item.stages,
+        }
+        if include_content:
+            row["content"] = chunk.content
+        items.append(row)
+    return items
+
+
+@app.get("/repos/{repo_id}/search")
+def repo_search(
+    repo: RepoAccess,
+    commit_sha: str,
+    q: str,
+    limit: int = DEFAULT_LIMIT,
+    token_budget: int = DEFAULT_TOKEN_BUDGET,
+    hops: int = 1,
+    vector: bool = True,
+    path_prefix: Annotated[list[str] | None, Query()] = None,
+    kind: Annotated[list[str] | None, Query()] = None,
+) -> dict:
+    """Hybrid retrieval over the chunk index (build-plan.md Part 4.E).
+
+    Returns budget-fitted spans with file+line citations, plus one entry per
+    pipeline stage saying whether it ran or was skipped and why — a skipped
+    vector stage (no embeddings yet, no API key) is a reported fact, not a
+    silent absence of results."""
+    assert repo.id is not None
+    query = _retrieval_query(q, limit, token_budget, hops, vector, path_prefix, kind)
+    try:
+        with api_connection() as conn:
+            result = retrieve(conn, repo.id, commit_sha, query, embedder=_query_embedder())
+    except psycopg.errors.UndefinedTable:
+        raise _semantic_index_required() from None
+    return {
+        "commit_sha": commit_sha,
+        "query": q,
+        "results": _result_payload(result, include_content=True),
+        "citations": [c.model_dump(exclude_none=True) for c in result.citations()],
+        "stages": [s.as_dict() for s in result.stages],
+        "budget": _budget_payload(result),
+    }
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=8000)
+    # Continue an existing thread, or omit to start one.
+    thread_id: str | None = None
+    token_budget: int = DEFAULT_TOKEN_BUDGET
+    limit: int = DEFAULT_LIMIT
+    hops: int = 1
+    vector: bool = True
+    path_prefix: list[str] = []
+    kind: list[str] = []
+
+
+def _chat_thread(
+    conn: psycopg.Connection,
+    repo_id: str,
+    commit_sha: str,
+    thread_id: str | None,
+    user_id: str,
+) -> ChatThread | None:
+    """Resolve a caller-supplied thread id, or None to start a new thread.
+
+    A thread is scoped to one repo, one commit and one user: continuing
+    someone else's thread, or a thread from another snapshot, is a 404 rather
+    than a 403 — the caller has no business knowing it exists."""
+    if thread_id is None:
+        return None
+    require_uuid(thread_id, "thread")
+    thread = get_chat_thread(conn, thread_id)
+    if (
+        thread is None
+        or thread.repo_id != repo_id
+        or thread.user_id != user_id
+        or thread.commit_sha != commit_sha
+    ):
+        raise HTTPException(404, "thread not found")
+    return thread
+
+
+@app.post("/repos/{repo_id}/chat")
+def repo_chat(
+    repo: RepoAccess,
+    req: ChatRequest,
+    commit_sha: str,
+    user: CurrentUser,
+    service: Annotated[ModelService, Depends(get_model_service)],
+) -> dict:
+    """Grounded chat with validated citations (build-plan.md Part 8).
+
+    Retrieval is deterministic; the model only narrates the spans it is given,
+    framed as untrusted data. Every path, symbol and line range it cites is
+    checked against this snapshot **before** the answer is persisted or
+    returned: a citation that does not resolve returns 422 with the reason per
+    citation and stores no assistant message. Non-streaming — see
+    `app.analysis.semantic.chat.STREAMING_GAP`."""
+    assert repo.id is not None and repo.project_id is not None
+    repo_id = repo.id
+
+    query = _retrieval_query(
+        req.message,
+        req.limit,
+        req.token_budget,
+        req.hops,
+        req.vector,
+        req.path_prefix,
+        req.kind,
+    )
+    try:
+        with api_connection() as conn:
+            thread = _chat_thread(conn, repo_id, commit_sha, req.thread_id, user.id)
+            result = retrieve(conn, repo_id, commit_sha, query, embedder=_query_embedder())
+    except psycopg.errors.UndefinedTable:
+        raise _semantic_index_required() from None
+
+    with worker_connection() as conn:
+        if thread is None:
+            thread = create_chat_thread(conn, repo_id, commit_sha, user.id, req.message[:200])
+        insert_chat_message(
+            conn, ChatMessage(thread_id=thread.id, role="user", content=req.message)
+        )
+
+    base = {
+        "thread_id": thread.id,
+        "commit_sha": commit_sha,
+        "stages": [s.as_dict() for s in result.stages],
+        "budget": _budget_payload(result),
+        "evidence": _result_payload(result, include_content=False),
+        "streaming": STREAMING_GAP,
+    }
+
+    if not result.items:
+        # No evidence means no model call: there is nothing to ground an
+        # answer in, and generating anyway is exactly the failure mode the
+        # citation validator exists to catch. Said plainly instead.
+        return {
+            **base,
+            "status": "no_evidence",
+            "message_id": None,
+            "answer": None,
+            "claims": [],
+            "citations": [],
+            "unsupported": (
+                "No indexed code matched this question at this commit, so there is "
+                "nothing to answer from. The repository may not be chunked yet."
+            ),
+        }
+
+    try:
+        with api_connection() as conn:
+            grounded = narrate(
+                conn,
+                service,
+                repo_id=repo_id,
+                commit_sha=commit_sha,
+                question=req.message,
+                retrieval=result,
+                context=CallContext(project_id=repo.project_id, repo_id=repo_id),
+            )
+    except StructuredOutputError as exc:
+        raise HTTPException(
+            502,
+            {"error": "model_output_invalid", "detail": str(exc), "thread_id": thread.id},
+        ) from None
+    except ModelServiceError as exc:
+        raise HTTPException(
+            502,
+            {"error": "model_call_failed", "detail": str(exc), "thread_id": thread.id},
+        ) from None
+
+    if not grounded.report.ok:
+        # Phase 3's exit criterion, enforced: the answer is discarded whole.
+        # Nothing is persisted, nothing is rephrased, and every rejected
+        # citation is returned with the reason it failed.
+        raise HTTPException(
+            422,
+            {
+                "error": "citation_check_failed",
+                "thread_id": thread.id,
+                "checked": grounded.report.checked,
+                "unsupported_claims": grounded.report.unsupported_claim_count,
+                "rejected": [r.as_dict() for r in grounded.report.rejected],
+                "uncited_claim_indices": list(grounded.report.uncited_claim_indices),
+                "detail": (
+                    "the model cited code that does not exist in this snapshot; "
+                    "the answer was discarded rather than reworded"
+                ),
+            },
+        )
+
+    answer_text = grounded.answer_text()
+    with worker_connection() as conn:
+        stored = insert_chat_message(
+            conn,
+            ChatMessage(
+                thread_id=thread.id,
+                role="assistant",
+                content=answer_text,
+                citations=grounded.citations,
+                model="synth",
+            ),
+        )
+
+    return {
+        **base,
+        "status": "ok",
+        "message_id": stored.id,
+        "answer": answer_text,
+        "claims": [
+            {
+                "text": claim.text,
+                "citations": [c.model_dump(exclude_none=True) for c in claim.citations],
+            }
+            for claim in grounded.answer.claims
+        ],
+        "citations": grounded.citation_payload(),
+        "unsupported": grounded.answer.unsupported,
+        "citation_check": {"checked": grounded.report.checked, "rejected": 0},
+    }
+
+
+@app.get("/repos/{repo_id}/chat/{thread_id}")
+def repo_chat_thread(repo: RepoAccess, thread_id: str, commit_sha: str, user: CurrentUser) -> dict:
+    """One thread's persisted messages, oldest first, with their stored
+    citations. Part 4.F's "context rebuilt after session end" starts here:
+    the thread is the record, not the client's memory."""
+    assert repo.id is not None
+    try:
+        with api_connection() as conn:
+            thread = _chat_thread(conn, repo.id, commit_sha, thread_id, user.id)
+            assert thread is not None
+            messages = list_chat_messages(conn, thread.id)
+    except psycopg.errors.UndefinedTable:
+        raise _semantic_index_required() from None
+    return {
+        "thread_id": thread.id,
+        "commit_sha": thread.commit_sha,
+        "title": thread.title,
+        "messages": [
+            {
+                "id": m.id,
+                "role": m.role,
+                "content": m.content,
+                "citations": [c.model_dump(exclude_none=True) for c in m.citations],
+                "model": m.model,
+                "created_at": m.created_at.isoformat() if m.created_at else None,
+            }
+            for m in messages
+        ],
+    }
+
+
+# ----------------------------------------------- Inspector explanation
+#
+# Part 7's "Purpose (grounded explanation, with citations)" field. These
+# routes **serve stored summaries only**: generation belongs to the analysis
+# pass (Pass 2b), so a snapshot that has not been summarized returns 404 with
+# the reason rather than quietly producing prose on request. A summary is
+# always `origin='inferred'` -- model prose about facts the analyzers
+# established -- and ships with the evidence it was written from so every
+# statement stays clickable back to source (Part 5).
+
+
+def _explanation_payload(summary) -> dict:
+    evidence = summary.evidence
+    return {
+        "level": summary.level,
+        "scope_key": summary.scope_key,
+        "node_id": summary.node_id,
+        "summary": summary.summary,
+        # Never presented as parsed fact: the UI keys its "AI observation"
+        # treatment off this field (Part 4.C).
+        "origin": summary.origin,
+        "model": summary.model,
+        "analyzer": summary.analyzer,
+        "analyzer_version": summary.analyzer_version,
+        "created_at": summary.created_at.isoformat() if summary.created_at else None,
+        # The file+line spans behind the prose, in the same shape every other
+        # cited surface uses.
+        "citations": [c.model_dump(exclude_none=True) for c in evidence.spans],
+        "evidence": {
+            "input": evidence.input,
+            "chunk_ids": evidence.chunk_ids,
+            "node_ids": evidence.node_ids,
+            "children": evidence.children,
+            "truncated": evidence.truncated,
+        },
+    }
+
+
+_NO_EXPLANATION = (
+    "no stored explanation for this scope at this commit: the summary pass has "
+    "not run, was skipped (no model provider configured), or did not reach this "
+    "scope within its budget. Explanations are never generated on request."
+)
+
+
+@app.get("/repos/{repo_id}/nodes/{node_id}/explanation")
+def node_explanation(repo: RepoAccess, node_id: int, commit_sha: str) -> dict:
+    """The stored grounded explanation for one node -- a symbol, a file, or a
+    cluster (candidate component). 404 when none was written."""
+    assert repo.id is not None
+    try:
+        with api_connection() as conn:
+            summary = get_summary_for_node(conn, repo.id, commit_sha, node_id)
+    except psycopg.errors.UndefinedTable:
+        raise _semantic_index_required() from None
+    if summary is None:
+        raise HTTPException(404, _NO_EXPLANATION)
+    return _explanation_payload(summary)
+
+
+@app.get("/repos/{repo_id}/explanation")
+def scope_explanation(
+    repo: RepoAccess, commit_sha: str, level: str, scope_key: str = ""
+) -> dict:
+    """The stored explanation for a scope addressed by level + key: a file
+    path, a directory path, a component key, or `''` for the whole repo."""
+    assert repo.id is not None
+    if level not in ("symbol", "file", "directory", "component", "repo"):
+        raise HTTPException(422, "level must be one of: symbol, file, directory, component, repo")
+    try:
+        with api_connection() as conn:
+            summary = get_summary(conn, repo.id, commit_sha, level, scope_key)
+    except psycopg.errors.UndefinedTable:
+        raise _semantic_index_required() from None
+    if summary is None:
+        raise HTTPException(404, _NO_EXPLANATION)
+    return _explanation_payload(summary)

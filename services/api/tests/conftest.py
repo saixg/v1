@@ -202,3 +202,19 @@ def db_project(make_user: Callable[[], str]) -> str:
     with worker_connection() as conn:
         project = create_project(conn, "test project", make_user())
     return project.id
+
+
+# ------------------------------------------- no live model calls from tests
+
+@pytest.fixture(autouse=True)
+def _no_live_embedding_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep `VOYAGE_API_KEY` out of every test's environment.
+
+    `load_dotenv()` above pulls in the real `.env`, which on a developer
+    machine may hold a working Voyage key. Without this, any test that runs a
+    full scan pass would embed for real: money spent, a network dependency in
+    the suite, and repository text leaving the machine during a test run.
+    Tests that need the key present set it themselves with `monkeypatch`;
+    tests that need a provider inject a fake one.
+    """
+    monkeypatch.delenv("VOYAGE_API_KEY", raising=False)

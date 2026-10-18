@@ -19,19 +19,19 @@ MAX_GRAPH_DEPTH = 5
 _NODE_COLUMNS = """
     id, repo_id, commit_sha, kind, name, path, line_start, line_end,
     col_start, col_end, attrs, analyzer, analyzer_version, status,
-    source_file, confidence, reason
+    source_file, confidence, reason, origin
 """
 
 _NODE_COLUMNS_PREFIXED = """
     n.id, n.repo_id, n.commit_sha, n.kind, n.name, n.path, n.line_start, n.line_end,
     n.col_start, n.col_end, n.attrs, n.analyzer, n.analyzer_version, n.status,
-    n.source_file, n.confidence, n.reason
+    n.source_file, n.confidence, n.reason, n.origin
 """
 
 _EDGE_COLUMNS = """
     id, repo_id, commit_sha, kind, src_id, dst_id, line_start, line_end,
     col_start, col_end, analyzer, analyzer_version, status, source_file,
-    confidence, reason, resolution_status, attrs
+    confidence, reason, resolution_status, attrs, origin
 """
 
 

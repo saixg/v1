@@ -1,7 +1,8 @@
 """Per-call cost estimate, USD. An estimate for observability and budget caps,
 not an invoice — the provider's billing is authoritative.
 
-Anthropic first-party list prices, cached 2026-10-06 (claude-api reference).
+Anthropic first-party list prices, cached 2026-10-06 (claude-api reference);
+Voyage AI list price cached 2026-10-17 (docs.voyageai.com/docs/pricing).
 Update this table when prices change; an unknown model yields cost=None
 (recorded as "not priced"), never a guessed number.
 """
@@ -10,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from app.llm.routing import HAIKU, OPUS, SONNET
+from app.llm.routing import HAIKU, OPUS, SONNET, VOYAGE_CODE_3
 
 _PER_MTOK = 1_000_000
 
@@ -41,6 +42,12 @@ PRICES: dict[str, ModelPrice] = {
         long_context_threshold=100_000,
         long_input_per_mtok=0.50,
         long_output_per_mtok=2.50,
+    ),
+    # Voyage AI list price, read from docs.voyageai.com/docs/pricing on
+    # 2026-10-17: voyage-code-3 is $0.18 per million tokens. Embeddings bill
+    # input tokens only -- there are no output or cache tokens, hence 0.0.
+    VOYAGE_CODE_3: ModelPrice(
+        input_per_mtok=0.18, output_per_mtok=0.0, cache_read_per_mtok=0.0
     ),
 }
 

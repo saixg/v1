@@ -141,7 +141,14 @@ def run_fixture(fixture_dir: Path) -> list[str]:
 
 
 def _check_edge(
-    conn, repo_id: str, commit_sha: str, by_path: dict, kind: str, exp: dict, *, require_status: bool
+    conn,
+    repo_id: str,
+    commit_sha: str,
+    by_path: dict,
+    kind: str,
+    exp: dict,
+    *,
+    require_status: bool,
 ) -> list[str]:
     src = by_path.get(exp["src_path"])
     if src is None or src.id is None:

@@ -264,9 +264,11 @@ def test_images_only_accepted_by_vision_role():
 
 
 def test_unrouted_role_raises_before_any_call():
+    # `rerank` is the role with no entry in the table ("embed" has had one
+    # since Part 13 #2 was settled on 2026-10-17).
     service, provider, rows = make([])
     with pytest.raises(UnroutedRoleError):
-        service.generate_text("x", "embed")
+        service.generate_text("x", "rerank")
     assert provider.requests == [] and rows == []
 
 
@@ -284,10 +286,19 @@ def test_routes_override_is_a_config_change():
     assert provider.requests[0].model == "claude-opus-5-5"
 
 
-def test_embed_and_rerank_are_explicit_stubs():
+def test_rerank_is_an_explicit_stub():
     service, _, rows = make([])
-    with pytest.raises(NotImplementedError, match="Part 13"):
-        service.embed(["a"])
     with pytest.raises(NotImplementedError, match="eval"):
         service.rerank("q", ["a"])
+    assert rows == []
+
+
+def test_embed_without_a_provider_fails_visibly():
+    # `embed` is implemented (see tests/llm/test_embeddings.py) but a service
+    # built with no embedding provider must say so, not return zeros.
+    from app.llm import EmbeddingNotConfiguredError
+
+    service, _, rows = make([])
+    with pytest.raises(EmbeddingNotConfiguredError):
+        service.embed(["a"])
     assert rows == []

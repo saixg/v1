@@ -21,9 +21,10 @@ def insert_nodes(conn: psycopg.Connection, nodes: list[Node]) -> list[int]:
                 insert into codeaxis.nodes (
                     repo_id, commit_sha, kind, name, path,
                     line_start, line_end, col_start, col_end, attrs,
-                    analyzer, analyzer_version, status, source_file, confidence, reason
+                    analyzer, analyzer_version, status, source_file, confidence, reason,
+                    origin
                 )
-                values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 returning id
                 """,
                 (
@@ -43,6 +44,7 @@ def insert_nodes(conn: psycopg.Connection, nodes: list[Node]) -> list[int]:
                     node.source_file,
                     node.confidence,
                     node.reason,
+                    node.origin,
                 ),
             ).fetchone()
             assert row is not None
@@ -62,9 +64,9 @@ def insert_edges(conn: psycopg.Connection, edges: list[Edge]) -> list[int]:
                     repo_id, commit_sha, kind, src_id, dst_id,
                     line_start, line_end, col_start, col_end,
                     analyzer, analyzer_version, status, source_file, confidence, reason,
-                    resolution_status, attrs
+                    resolution_status, attrs, origin
                 )
-                values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 returning id
                 """,
                 (
@@ -85,6 +87,7 @@ def insert_edges(conn: psycopg.Connection, edges: list[Edge]) -> list[int]:
                     edge.reason,
                     edge.resolution_status,
                     json.dumps(edge.attrs),
+                    edge.origin,
                 ),
             ).fetchone()
             assert row is not None
