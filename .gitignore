@@ -28,5 +28,26 @@ packages/graph/supabase/.temp/
 # OS / editor
 .DS_Store
 Thumbs.db
-.vscode/*
-!.vscode/settings.json
+.vscode/
+
+# Agent tooling (local only, not part of the product)
+.claude/
+.agents/
+skills-lock.json
+CLAUDE.md
+
+# Superseded specs — build-plan.md is authoritative; these stay on disk for
+# reference only (docs/STATUS.md is tracked).
+docs/00-product-spec.md
+docs/01-evidence-model.md
+docs/02-features.md
+docs/03-architecture.md
+docs/04-graph-schema.md
+docs/05-analysis-pipeline.md
+docs/06-retrieval-narration.md
+docs/07-frontend.md
+docs/08-security.md
+docs/09-performance.md
+docs/10-api.md
+docs/11-acceptance-criteria.md
+docs/12-build-order.md
