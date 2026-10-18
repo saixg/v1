@@ -226,3 +226,29 @@ backend tests are the evidence here, not a browser session.
 ## First three actions (pending your go-ahead)
 
 Blocked on the contradiction above — asking before proceeding.
+
+## 2026-10-18 update: Phase 4 audit (Agent Context Engine) — pre-build
+
+Audit protocol 0.2 run before writing any Phase 4 code. Baseline verified this
+session: `uv run ruff check .` clean, `uv run pyright` 0 errors, full `pytest`
+re-run (result recorded in the build entry that follows this one).
+
+| Item (build-plan.md Part 4.F / Part 10 Phase 4) | Status | Evidence |
+|---|---|---|
+| `app/context/` module | `missing` — stub only | `services/api/app/context/__init__.py` is a 3-line `# STUB(CodeAxis):` placeholder; no other file in the package |
+| Tables `tasks, requirements, constraints, decisions, context_items, task_components, task_snapshots, verification_results, context_packages` | `missing` | `supabase/migrations/` has 10 files, none mentioning any of these; last is `20261019000000_semantic.sql` (chunks/summaries/conventions/chat) |
+| `api_tokens` table (per-repo MCP tokens) | `missing` | not in any migration; `codeaxis.jobs`/`llm_calls`/`chat_*` are the newest tables |
+| Task/document intake (PDF/DOCX/image) | `missing` | no `pypdf`/`python-docx`/vision-input code; `services/api/pyproject.toml` has no document deps |
+| Requirement + constraint extraction/validation | `missing` | no prompt, schema or route; `app/analysis/semantic/prompts.py` covers summaries + chat only |
+| Constraint ledger | `missing` | no table, no auto-detection pass, no UI |
+| Context package assembly | `missing` | `app/analysis/semantic/retrieve.py` provides the budgeted retrieval this will sit on (`retrieve()`, `RetrievalResult`, `StageOutcome`) — reusable, not a gap |
+| Exports (`CLAUDE.md` / `AGENTS.md` / `context.md`) | `missing` | no export route or renderer |
+| Read-only MCP server (`/mcp/{repositoryId}`, 7 tools) | `missing` | `grep -n "@app\." app/main.py` → 21 routes, none under `/mcp` or `/tasks` |
+| Context-area API routes (Part 8) | `missing` | same grep: no `/tasks*` route exists |
+| Frontend task/constraint/context surfaces | `missing` | `apps/web/src/components/` has Explorer/Inspector/AskView/CoverageView only |
+| With/without-context eval | `missing` | `evals/graders/` has `graph_sanity.py` + `citations.py` only |
+| Reusable foundations Phase 4 builds on | `exists` | Clerk JWT + project membership (`app/auth.py`), read-only `api_connection` / read-write `worker_connection` (`app/knowledge/db.py`), `ModelService.generate_structured` with schema validation + one retry (`app/llm/service.py`), hybrid retrieval and citation validator (`app/analysis/semantic/{retrieve,citations}.py`), `codeaxis.conventions` rows for the "patterns/conventions" slice of a package |
+
+Conclusion: **Phase 4 is missing in full.** Nothing to preserve, nothing to
+rewrite. Phases 0–3 provide auth, snapshots, retrieval, citation validation and
+the model layer the phase depends on, all verified above.

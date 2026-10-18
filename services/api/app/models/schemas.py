@@ -494,3 +494,459 @@ class Convention(BaseModel):
     analyzer: str
     analyzer_version: str
     created_at: datetime | None = None
+
+
+# --- Agent Context Engine (build-plan.md Part 4.F) --------------------------
+
+# The snapshot key in this codebase is the `(repo_id, commit_sha)` pair, not a
+# `snapshot_id` uuid (there is no `repository_snapshots` table — see the
+# comment block at the top of
+# supabase/migrations/20261020000000_context_engine.sql). Every model below
+# therefore carries both, including models that also carry `task_id` whose
+# task already names a snapshot: scoping to a commit must be expressible
+# without a join, so rows analyzed at one commit can never answer a query
+# about another.
+#
+# Untrusted data: `Task.intent`, `Requirement.statement`,
+# `Constraint.statement` and `ContextItem.content` hold user prose, document
+# text, or repository text. None of it is ever an instruction (Part 0.3).
+
+
+class ContextEvidence(BaseModel):
+    """What one context-engine record was derived from, named precisely enough
+    that the UI can link it back to source (Part 5).
+
+    Assembled by the pass from what it actually read — never taken from a
+    model's own output, which is prose about facts and not a source of facts
+    (Part 0.3). Same contract as `SummaryEvidence`, with document refs added
+    because Part 4.F.1 ingests PDFs, DOCX and images alongside code.
+    """
+
+    # File+line spans in the snapshot. `Citation` is reused rather than
+    # re-declared so the citation validator that already checks chat answers
+    # checks these too.
+    spans: list[Citation] = []
+    node_ids: list[int] = []
+    chunk_ids: list[int] = []
+    # Non-code inputs: {"source": "pdf"|"docx"|"image"|"text"|"repo_doc",
+    # "ref": "<filename>", "page": "3", "region": "..."} — page and region
+    # refs are kept so a statement extracted from a document stays traceable
+    # to the place in that document (Part 4.F.1).
+    documents: list[dict[str, str]] = []
+    # Why this record exists, when the spans alone do not say it.
+    notes: str | None = None
+    # True when the inputs had to be capped to stay inside a prompt or token
+    # budget — an admitted gap, not a silent one.
+    truncated: bool = False
+
+    def evidence_json(self) -> str:
+        """The `evidence` jsonb payload, for the insert in app.knowledge.
+        Named `evidence_json` for the same reason `SummaryEvidence`'s is: not
+        to shadow pydantic's own (deprecated) `BaseModel.json`."""
+        return json.dumps(
+            {
+                "spans": [s.model_dump(exclude_none=True) for s in self.spans],
+                "node_ids": self.node_ids,
+                "chunk_ids": self.chunk_ids,
+                "documents": self.documents,
+                "notes": self.notes,
+                "truncated": self.truncated,
+            }
+        )
+
+
+# draft/extracting/ready/blocked/archived. `blocked` is load-bearing: Part
+# 4.F.3 forbids inventing a missing requirement, so a contradiction or a gap
+# stops the task until a human resolves it rather than being papered over.
+TaskStatus = Literal["draft", "extracting", "ready", "blocked", "archived"]
+
+
+class Task(BaseModel):
+    """codeaxis.tasks: one thing a developer wants built or changed, grounded
+    against exactly one snapshot of one repo."""
+
+    id: RepoId | None = None  # uuid, assigned by the database on insert
+    project_id: RepoId
+    repo_id: RepoId
+    commit_sha: str
+    title: str = Field(min_length=1, max_length=300)
+    # Raw input, kept verbatim so extraction can be re-run and audited
+    # against what the user actually wrote. Untrusted data.
+    intent: str | None = None
+    status: TaskStatus = "draft"
+    created_by: str | None = None  # Clerk user id (profiles.id is text)
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+# The seven buckets of Part 4.F.2's extraction schema. `open_question` is one
+# of them, not an error state: a gap is stored as a question.
+RequirementKind = Literal[
+    "objective",
+    "functional",
+    "technical",
+    "architectural",
+    "existing_behavior",
+    "acceptance_criteria",
+    "open_question",
+]
+
+# `ambiguous` and `unresolved` are valid stored states (Part 0.3). Both
+# require a `question` saying what is missing.
+RequirementStatus = Literal["open", "ambiguous", "unresolved", "satisfied", "rejected"]
+
+# None is not "could": an unstated priority is unknown, not low.
+RequirementPriority = Literal["must", "should", "could"]
+
+
+class Requirement(BaseModel):
+    """codeaxis.requirements: one extracted statement, with its own origin,
+    evidence and status so it can be confirmed or contradicted individually."""
+
+    id: RepoId | None = None
+    task_id: RepoId
+    repo_id: RepoId
+    commit_sha: str
+    kind: RequirementKind
+    statement: str = Field(min_length=1)
+    priority: RequirementPriority | None = None
+    status: RequirementStatus = "open"
+    # What exactly is missing or contradictory. Required whenever the status
+    # is not a clean one, so an ambiguity is never a bare flag.
+    question: str | None = None
+    origin: OriginTag
+    # Where in the input this came from: {"source": ..., "page": ..., ...}.
+    # Kept as a free dict because intake formats differ; `ContextEvidence`
+    # covers the code side.
+    source_ref: dict = {}
+    evidence: ContextEvidence = ContextEvidence()
+    ordinal: int = Field(default=0, ge=0)
+    confidence: float | None = Field(default=None, ge=0, le=1)
+    model: str | None = None
+    analyzer: str
+    analyzer_version: str
+    created_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def _unclean_status_states_why(self) -> Requirement:
+        if self.status in ("ambiguous", "unresolved") and not self.question:
+            raise ValueError("an ambiguous/unresolved requirement must state its question")
+        return self
+
+
+# What the constraint is about (Part 4.F.8's own list: public API, DB schema,
+# auth boundaries, CI/lint rules, "do not touch" paths).
+ConstraintKind = Literal[
+    "public_api",
+    "db_schema",
+    "auth_boundary",
+    "ci_lint",
+    "do_not_touch",
+    "dependency",
+    "performance",
+    "other",
+]
+
+# hard — violating it makes the work wrong; soft — a tradeoff with a reason.
+ConstraintSeverity = Literal["hard", "soft"]
+
+# Who put it in the ledger. Kept separate from `origin` so the human/analyzer
+# distinction is queryable without overloading Part 5's enum.
+ConstraintSource = Literal["user_stated", "auto_detected"]
+
+
+class Constraint(BaseModel):
+    """codeaxis.constraints: one entry in the Constraint Ledger (Part 4.F.8).
+
+    Constraints are the one section of a context package that is never
+    truncated (Part 4.F.5), which is why they are their own record with their
+    own severity rather than a `Requirement` kind.
+
+    `task_id` is optional: auto-detected repo constraints belong to the repo
+    at a commit and are reused by every task (and by the MCP
+    `get_constraints` tool, which is per-repo).
+    """
+
+    id: RepoId | None = None
+    task_id: RepoId | None = None
+    repo_id: RepoId
+    commit_sha: str
+    kind: ConstraintKind
+    # What it applies to: a path or glob, a component key, a symbol, or
+    # 'repo'. Free text because the addressable things differ per kind.
+    scope: str = Field(min_length=1)
+    statement: str = Field(min_length=1)
+    severity: ConstraintSeverity
+    source: ConstraintSource
+    # A user-stated constraint is recorded as `configured`: it is an explicit
+    # rule stated for this repository, and emphatically not `inferred` — no
+    # model produced it.
+    origin: OriginTag
+    # A human has accepted this entry. Auto-detected entries start False: an
+    # unconfirmed detection is shown as a detection, never as an agreed rule.
+    confirmed: bool = False
+    confirmed_by: str | None = None
+    confirmed_at: datetime | None = None
+    rationale: str | None = None
+    evidence: ContextEvidence = ContextEvidence()
+    # None for a user-stated constraint: no analyzer produced it, and writing
+    # a fake analyzer name would corrupt provenance.
+    analyzer: str | None = None
+    analyzer_version: str | None = None
+    created_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def _provenance_matches_source(self) -> Constraint:
+        if self.source == "auto_detected" and not (self.analyzer and self.analyzer_version):
+            raise ValueError("an auto-detected constraint must name its analyzer and version")
+        if self.source == "user_stated" and self.origin != "configured":
+            raise ValueError("a user-stated constraint has origin='configured', not a model tag")
+        if self.confirmed and self.confirmed_at is None:
+            raise ValueError("a confirmed constraint must record confirmed_at")
+        return self
+
+
+# `open` with no decision is the normal resting state of an unresolved
+# question — storing it is the point (Part 4.F.6).
+DecisionStatus = Literal["open", "decided", "superseded"]
+
+
+class Decision(BaseModel):
+    """codeaxis.decisions: a decision taken on a task, or an open question
+    still waiting for one. An approved decision is `locked`: later passes read
+    it, never rewrite it (Part 4.G.9)."""
+
+    id: RepoId | None = None
+    task_id: RepoId
+    repo_id: RepoId
+    commit_sha: str
+    question: str = Field(min_length=1)
+    decision: str | None = None
+    status: DecisionStatus = "open"
+    locked: bool = False
+    decided_by: str | None = None
+    decided_at: datetime | None = None
+    rationale: str | None = None
+    supersedes_id: RepoId | None = None
+    origin: OriginTag
+    evidence: ContextEvidence = ContextEvidence()
+    analyzer: str
+    analyzer_version: str
+    created_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def _decided_rows_are_complete(self) -> Decision:
+        if self.status == "decided" and not (self.decision and self.decided_at):
+            raise ValueError("a decided row must carry both decision and decided_at")
+        if self.locked and self.status != "decided":
+            raise ValueError("only a decided row can be locked")
+        return self
+
+
+# The nine sections of Part 4.F.5's package order. The order itself belongs to
+# the assembler, not to this enum, so changing presentation never requires a
+# schema change.
+ContextItemKind = Literal[
+    "task_intent",
+    "constraint",
+    "requirement",
+    "architecture",
+    "code",
+    "convention",
+    "test",
+    "limitation",
+    "open_question",
+]
+
+
+class ContextItem(BaseModel):
+    """codeaxis.context_items. Part 6 names the columns
+    `(id, task_id, kind, content, origin, snapshot_id, evidence jsonb)`;
+    `snapshot_id` is realized here as `(repo_id, commit_sha)`, the snapshot key
+    this repository actually uses.
+
+    One row per assembled piece of context rather than one rendered blob, so
+    every line of a delivered package still points at its source and carries
+    its own origin tag.
+    """
+
+    id: RepoId | None = None
+    task_id: RepoId
+    # The package this item was assembled into. None while the item exists but
+    # no package has been built from it: extraction and assembly are separate
+    # passes.
+    package_id: RepoId | None = None
+    repo_id: RepoId
+    commit_sha: str
+    kind: ContextItemKind
+    content: str
+    origin: OriginTag
+    evidence: ContextEvidence = ContextEvidence()
+    token_count: int = Field(default=0, ge=0)
+    ordinal: int = Field(default=0, ge=0)
+    analyzer: str
+    analyzer_version: str
+    created_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def _code_items_are_citable(self) -> ContextItem:
+        # A source excerpt handed to an agent without a file+line span is
+        # unusable and uncitable, so these two kinds must carry one. The other
+        # kinds legitimately have none (a user-typed constraint, an open
+        # question), and demanding a span there would push callers to invent
+        # one — exactly what Part 0.3 forbids.
+        if self.kind in ("code", "test") and not self.evidence.spans:
+            raise ValueError("a 'code'/'test' context item must carry at least one span")
+        return self
+
+
+# primary    — the work happens here
+# supporting — needed to understand or call into the primary component
+# impacted   — may break; impact analysis found a path to it
+ComponentRelevance = Literal["primary", "supporting", "impacted"]
+
+
+class TaskComponent(BaseModel):
+    """codeaxis.task_components: a task's link to an existing graph entity.
+    Points at `codeaxis.nodes` (components are `kind='cluster'` nodes here), so
+    a task can never reference a component absent from the snapshot."""
+
+    task_id: RepoId
+    node_id: int
+    repo_id: RepoId
+    commit_sha: str
+    relevance: ComponentRelevance
+    rationale: str | None = None
+    origin: OriginTag
+    confidence: float | None = Field(default=None, ge=0, le=1)
+    evidence: ContextEvidence = ContextEvidence()
+    analyzer: str
+    analyzer_version: str
+    created_at: datetime | None = None
+
+
+TaskSnapshotStatus = Literal["active", "stale", "superseded"]
+
+
+class TaskSnapshot(BaseModel):
+    """codeaxis.task_snapshots: the audit trail of which snapshots a task has
+    been grounded against (Part 4.F.6). Exactly one row per task is `active`;
+    every other row says why it stopped being."""
+
+    id: int | None = None  # bigserial
+    task_id: RepoId
+    repo_id: RepoId
+    commit_sha: str
+    status: TaskSnapshotStatus
+    reason: str | None = None
+    created_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def _inactive_rows_state_why(self) -> TaskSnapshot:
+        if self.status != "active" and not self.reason:
+            raise ValueError("a stale/superseded grounding must record the reason")
+        return self
+
+
+# `not_run` is the honest default: CodeAxis never executes repository code
+# (Part 0.3 / Part 9), so no outcome here is produced by running anything.
+VerificationOutcome = Literal["passed", "failed", "inconclusive", "not_run"]
+
+# Who reported it. There is deliberately no 'codeaxis_execution' value.
+VerificationSource = Literal["user", "analyzer", "external"]
+
+
+class VerificationResult(BaseModel):
+    """codeaxis.verification_results: an outcome *reported in* for one of a
+    task's acceptance criteria — by a human, by one of our static passes, or
+    by an external CI system. Never the product of executing repo code."""
+
+    id: int | None = None  # bigserial
+    task_id: RepoId
+    repo_id: RepoId
+    commit_sha: str
+    # The requirement being verified, when it is one of ours. `criterion`
+    # keeps the human-readable statement so the history survives a
+    # re-extraction that replaces requirement rows.
+    requirement_id: RepoId | None = None
+    criterion: str = Field(min_length=1)
+    outcome: VerificationOutcome
+    detail: str | None = None
+    source: VerificationSource
+    evidence: ContextEvidence = ContextEvidence()
+    created_at: datetime | None = None
+
+
+# `invalid` is reachable and stored: Part 4.F.5 forbids truncating
+# constraints, so a budget that cannot hold them yields a package marked
+# invalid with the reason, never a quietly shortened one.
+ContextPackageStatus = Literal["assembled", "stale", "invalid"]
+
+
+class ContextPackage(BaseModel):
+    """codeaxis.context_packages: the budget decision record for one assembly.
+
+    Not a second copy of the content — that lives in `ContextItem` rows, so a
+    package can be re-rendered (API, CLAUDE.md, AGENTS.md) from rows that each
+    still carry their own evidence and snapshot. Assembly never mutates a
+    package; a new version is created instead, so an agent run can always be
+    traced to the exact package it was given.
+    """
+
+    id: RepoId | None = None
+    task_id: RepoId
+    repo_id: RepoId
+    commit_sha: str
+    version: int = Field(default=1, ge=1)
+    status: ContextPackageStatus = "assembled"
+    token_budget: int = Field(gt=0)
+    token_count: int = Field(default=0, ge=0)
+    # Which sections were included, in what order, and what was dropped for
+    # budget — so the UI can say "dropped 14 spans for budget" instead of
+    # silently shipping less context.
+    manifest: dict = {}
+    # Per-stage retrieval outcomes (ran/skipped + reason) from Pipeline E.
+    retrieval: dict = {}
+    # Gaps, contradictions and open questions carried into the package rather
+    # than resolved by guessing (Part 4.F.3).
+    unresolved: list[dict] = []
+    analyzer: str
+    analyzer_version: str
+    created_at: datetime | None = None
+
+
+class ApiToken(BaseModel):
+    """codeaxis.api_tokens: one per-repo, read-only MCP token (Part 4.F.7).
+
+    Holds the sha256 **hash** of the token, never the token. `token_hash` is
+    excluded from serialization so a route that returns this model cannot leak
+    it by accident; `app.knowledge.context` reads the attribute directly.
+    """
+
+    id: RepoId | None = None
+    project_id: RepoId
+    repo_id: RepoId
+    name: str = Field(min_length=1, max_length=200)
+    # Non-secret display/lookup handle (e.g. 'cxa_7f3b'); narrows verification
+    # to one candidate row so the secret comparison can be constant-time in
+    # Python rather than an SQL equality on secret material.
+    token_prefix: str = Field(min_length=1)
+    token_hash: str = Field(min_length=64, max_length=64, exclude=True, repr=False)
+    # V1 MCP is read-only, in the schema as well as in code.
+    scope: Literal["read"] = "read"
+    created_by: str | None = None
+    created_at: datetime | None = None
+    last_used_at: datetime | None = None
+    expires_at: datetime | None = None
+    # Revocation is a timestamp, not a delete: a revoked token's id stays
+    # referenceable by whatever logged its use.
+    revoked_at: datetime | None = None
+
+
+class IssuedApiToken(BaseModel):
+    """The one and only time the plaintext token exists outside the caller's
+    hands: the response to creating it. Never stored, never logged, never sent
+    to a model (Part 0.3)."""
+
+    token: str
+    record: ApiToken
