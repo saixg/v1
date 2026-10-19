@@ -252,3 +252,115 @@ re-run (result recorded in the build entry that follows this one).
 Conclusion: **Phase 4 is missing in full.** Nothing to preserve, nothing to
 rewrite. Phases 0–3 provide auth, snapshots, retrieval, citation validation and
 the model layer the phase depends on, all verified above.
+
+## 2026-10-19 update: Phase 4 shipped (A-E) and its gap closed — Agent Context Engine complete
+
+Three prior sessions (recorded only in commit messages, not here — the
+process gap this entry closes) built Phase 4 A through E in full. Backfilling
+what actually shipped, then closing one real gap found while verifying it.
+
+**A-C — data model, intake, extraction, ledger, packages, exports** (`c794676`):
+migration `20261020000000_context_engine.sql` (`tasks`, `context_packages`,
+`requirements`, `constraints`, `decisions`, `context_items`,
+`task_components`, `task_snapshots`, `verification_results`, `api_tokens` —
+all ten tables Part 6 names for the context engine); `app/context/{intake,
+extract,ledger,package,export,reground,grounding,validate,framing}.py`.
+Document intake (text/PDF/DOCX, new `pypdf`/`python-docx` deps) redacts
+secrets before any model call. Requirement extraction drops a claim that
+fails citation validation rather than keeping it. The constraint ledger
+holds user-stated and auto-detected rows side by side. Context-package
+assembly never truncates constraints (Part 4.F.5) and is budgeted for
+everything else. Exports render `CLAUDE.md`/`AGENTS.md`/`context.md`.
+Re-grounding re-runs across a moved snapshot.
+
+**D — routes, tokens, MCP** (`a75a261`): 18 routes under `app/context_api.py`
+(tasks, documents, requirements/extract, constraints CRUD + confirm,
+decisions, context packages, exports, reground), every one gated by the
+same project-membership check the rest of the API uses. Per-repo `api_tokens`
+(owner-only, plaintext shown once, hash stored). A constraint-ledger
+`pass_run` added after the semantic pass — its failure doesn't fail the scan.
+A hand-written read-only MCP server (`app/mcp_server.py`) at
+`POST /mcp/{repo_id}` with the 7 tools Part 4.F.7 names
+(`search_code`, `get_component`, `get_dependencies`, `get_constraints`,
+`impact_analysis`, `get_conventions`, `get_context_package`), every result
+labelled static analysis.
+
+**E — frontend** (`71bb9ed`): a fourth Workspace tab, Context
+(`apps/web/src/components/{TaskView,TaskIntake,RequirementsPanel,
+ConstraintLedger,ContextPackagePanel,ApiTokensPanel}.tsx`). Requirements
+show origin badges and lead ambiguous/unresolved rows with the server's own
+question. The ledger sorts hard before soft and only lets a user-stated row
+be edited. A stale or invalid context package is badged, never shown as
+current. Exports download under the server's filename; a refused export
+shows the server's reason with an explicit override path. Shipped "verified
+by lint/build only; no live click-through" per its own commit message.
+
+**Gap found and closed this session:** `evals/graders/with_without_context.py`
+(the Part 9 headline-adjacent "measurable lift vs. no context" grader,
+Part 10's Phase 4 exit line) was present on disk but **unrunnable** — it
+imported a `_context_support` helper module (`Checks`, `ScannedFixture`,
+`scan_fixture`, `delete_fixture`, `report`, `skip_reason`) that was never
+written, and skipped the `sys.path`/`load_dotenv` setup `citations.py` and
+`graph_sanity.py` both do directly. Written now
+(`evals/graders/_context_support.py`), adapting the existing scanned-fixture
+pattern from `services/api/tests/context/taskc_fixture_repo.py` (profile +
+project + repo, real scan pass, embeddings forced off since no
+`VOYAGE_API_KEY` is assumed) rather than inventing a new one. Its fixture
+repo (`orders-service`, 11 files) initially made the grader's own "package
+recall beats baseline" check fail-by-construction: at ~440 tokens the whole
+repo fit inside the 1500-token budget on both sides, so the naive lexical
+baseline trivially recalled everything too. Fixed by writing the fixture at
+the size and realism the module's docstring already called for ("tight
+enough that not every file fits") — ~2200 tokens across the same 11 files —
+not by loosening the threshold.
+
+**Verified, not assumed:** `uv run ruff check .` clean, `uv run pyright`
+0 errors, `uv run python evals/graders/with_without_context.py` → **PASS**
+against the live DB (package mean recall 0.95 vs. baseline 0.83, package
+constraint coverage 1.00 vs. baseline 0.03, every package status
+`assembled` and within budget), `citations.py` and `graph_sanity.py` both
+still PASS (nothing in the shared environment regressed). Full
+`uv run pytest -q -rs` → **504 passed, 1 skipped, 0 failed** (the skip is
+`test_sandbox_env.py`, Docker not installed) after fixing one real failure
+found along the way (below); two earlier attempts mid-session hit the same
+transient Supabase DNS/connection flakiness `graph_sanity.py`'s PASS entry
+already named, reproduced as infra, not code, by the clean final rerun. One
+unrelated fix needed to get the venv itself working: `.venv` was corrupted
+(missing `pyvenv.cfg`, no packages materialized despite a clean `uv sync`
+reporting success) — deleted and rebuilt; `python-dotenv` was the package
+that exposed it, since neither existing grader runs it through `uv run
+pytest`, only standalone, where the broken venv first showed.
+
+**Second, unrelated gap found and closed: a stale Phase 4.A-C test, broken
+by Phase 4.D.** `services/api/tests/context/test_package.py::
+test_assembly_orders_sections_persists_retrieval_and_cites_real_lines`
+asserted the first two constraint items were exactly
+`["Do not edit svc/store.py.", "Prefer small diffs."]`. Phase 4.D's
+constraint-ledger `pass_run` (`detect_ci_lint` in `app/context/ledger.py`)
+promotes the shared fixture repo's own `pyproject.toml` (`[tool.ruff]
+line-length = 100`) into a repo-level, soft, `ci_lint` constraint — "Ruff
+enforces a maximum line length of 100" — that sorts (`kind` ties alphabetize,
+`ci_lint` < `do_not_touch`) ahead of the task's own soft constraint. 4.A-C's
+commit predates 4.D's ledger pass by definition, so this test could never
+have been green after 4.D landed; it wasn't re-run end-to-end until this
+session. Fixed by asserting the two task-stated constraints' positions
+(hard-first, both present) instead of an exact list that hardcoded an
+incidental repo-level convention text — the invariant this test actually
+cares about, not the repo-level ledger's exact contents. Re-ran just this
+file standalone after the fix: 7 passed.
+
+**Not done:** the headline test itself — same task, same coding agent, with
+vs. without an exported package, measuring completion and constraint
+violations — remains a named, printed gap (`--emit DIR` writes each task's
+exported `CLAUDE.md` for that comparison; no lift number is reported because
+none was measured). This was always out of scope for a deterministic grader
+with no model call, per the module's own docstring, not a shortfall of this
+session's fix.
+
+Phase 4 exit criteria (Part 10): requirements/constraints stored as
+structured records — done; retrieved info has provenance — done (every
+context item carries `evidence`); context reconstructable after a session —
+done (packages are versioned, re-groundable); contradictions/missing info
+surfaced — done (`open_question` requirement kind, `unresolved` package
+entries); model output validated before persisting — done (citation-dropping
+extraction, retry-once `ModelService`). **Phase 4 is substantively complete.**

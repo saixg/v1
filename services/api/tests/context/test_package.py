@@ -221,10 +221,13 @@ def test_assembly_orders_sections_persists_retrieval_and_cites_real_lines(repo) 
     assert [rank[k] for k in kinds] == sorted(rank[k] for k in kinds)
     assert kinds[0] == "task_intent"
     constraint_items = [i for i in stored if i.kind == "constraint"]
-    assert [i.content for i in constraint_items][:2] == [
-        "Do not edit svc/store.py.",
-        "Prefer small diffs.",
-    ]
+    constraint_texts = [i.content for i in constraint_items]
+    # Hard constraints sort first; the fixture repo's own pyproject.toml also
+    # yields a repo-level auto-detected ci_lint constraint (Phase 4.D), so this
+    # only asserts the two task-stated constraints' relative positions, not an
+    # exact list, which would hardcode that incidental repo-level convention.
+    assert constraint_texts[0] == "Do not edit svc/store.py."
+    assert "Prefer small diffs." in constraint_texts
     assert any(i.kind == "requirement" for i in stored)
     code = [i for i in stored if i.kind == "code"]
     assert code
