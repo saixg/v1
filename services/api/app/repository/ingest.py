@@ -15,8 +15,10 @@ container isolation is deferred (see infra/sandbox/README.md).
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import os
 import shutil
+import socket
 import subprocess
 import tempfile
 import zipfile
@@ -27,6 +29,12 @@ from urllib.parse import urlparse
 from app.analysis.scan import ScanLimits
 
 SCRATCH_PREFIX = "codeaxis-"
+
+# A local folder is read in place, not copied — see `materialize_local`.
+# Disabled by default: any authenticated user can otherwise reach it via
+# POST /repos/stage simply by creating their own project, which would turn
+# it into an arbitrary-host-path read. An operator opts in per deployment.
+LOCAL_INGEST_ALLOWED_ROOTS_ENV = "LOCAL_INGEST_ALLOWED_ROOTS"
 
 GIT_TIMEOUT_SECONDS = 120
 # Remote transports git may use. `file`/`ext` are excluded: `ext::` runs an
@@ -66,15 +74,37 @@ def is_scratch_checkout(path: str | Path) -> bool:
 # ---------------------------------------------------------------- local
 
 
+def _allowed_local_roots() -> list[Path]:
+    """Resolved roots an operator has explicitly allowlisted for local-path
+    ingestion. Empty (the default) means the capability is disabled."""
+    raw = os.environ.get(LOCAL_INGEST_ALLOWED_ROOTS_ENV, "")
+    return [Path(p).resolve() for p in raw.split(";") if p.strip()]
+
+
 def materialize_local(path: str, commit_sha: str) -> MaterializedCheckout:
-    """A folder already on disk. Read in place, never copied or deleted."""
+    """A folder already on disk. Read in place, never copied or deleted.
+
+    Restricted to an operator-configured allowlist of root directories
+    (`LOCAL_INGEST_ALLOWED_ROOTS`); disabled entirely when that allowlist is
+    empty, since any authenticated user can otherwise reach this via
+    POST /repos/stage simply by creating their own project.
+    """
     if not commit_sha.strip():
         raise IngestError("commit_sha is required for a local folder")
-    resolved = Path(path).resolve()
-    if not resolved.exists():
-        raise IngestError(f"local path does not exist: {path}")
+    allowed_roots = _allowed_local_roots()
+    if not allowed_roots:
+        raise IngestError(
+            "local-path ingestion is disabled on this server "
+            f"(set {LOCAL_INGEST_ALLOWED_ROOTS_ENV} to enable it)"
+        )
+    try:
+        resolved = Path(path).resolve(strict=True)
+    except OSError as exc:
+        raise IngestError(f"local path does not exist: {path}") from exc
     if not resolved.is_dir():
         raise IngestError(f"local path is not a directory: {path}")
+    if not any(resolved.is_relative_to(root) for root in allowed_roots):
+        raise IngestError(f"local path is outside the allowed roots: {path}")
     return MaterializedCheckout(local_path=resolved, commit_sha=commit_sha, remote_url=None)
 
 
@@ -109,8 +139,51 @@ def run_git(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
         )
 
 
+def _is_blocked_ip(ip_str: str) -> bool:
+    """True for loopback, link-local (includes the 169.254.169.254 cloud
+    metadata address), private RFC1918/ULA, and other non-public ranges a
+    git remote must never resolve to."""
+    ip = ipaddress.ip_address(ip_str)
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
+def _resolve_and_block_private_hosts(hostname: str) -> None:
+    """Resolve every address `hostname` has today and reject if any of them
+    land in a private/loopback/link-local/metadata/reserved range.
+
+    Runs once, synchronously, before the git subprocess ever starts. This
+    does not defend against DNS rebinding: git's own HTTPS transport
+    re-resolves the same hostname independently when it actually connects,
+    with no guarantee it gets the same address this check saw. Closing that
+    fully would mean pinning the resolved IP for the real connection (a
+    filtering proxy, or `curl --resolve` in place of git's own transport) —
+    a materially larger change accepted as a known residual risk here,
+    since it requires an attacker to control DNS for the target domain and
+    win a narrow race on every single fetch.
+    """
+    try:
+        addrinfo = socket.getaddrinfo(hostname, None)
+    except socket.gaierror as exc:
+        raise IngestError(f"could not resolve repository host {hostname!r}: {exc}") from exc
+    resolved_ips = {str(info[4][0]) for info in addrinfo}
+    blocked = sorted(ip for ip in resolved_ips if _is_blocked_ip(ip))
+    if blocked:
+        raise IngestError(
+            f"repository host {hostname!r} resolves to a disallowed "
+            f"address ({', '.join(blocked)}); only public hosts are allowed"
+        )
+
+
 def _validate_remote(remote_url: str, ref: str | None) -> None:
-    scheme = urlparse(remote_url).scheme.lower()
+    parsed = urlparse(remote_url)
+    scheme = parsed.scheme.lower()
     if scheme not in ALLOWED_GIT_SCHEMES:
         allowed = ", ".join(sorted(ALLOWED_GIT_SCHEMES))
         raise IngestError(f"unsupported repository URL scheme {scheme!r}; allowed: {allowed}")
@@ -119,6 +192,15 @@ def _validate_remote(remote_url: str, ref: str | None) -> None:
         raise IngestError("repository URL must not start with '-'")
     if ref is not None and (not ref.strip() or ref.startswith("-")):
         raise IngestError(f"invalid ref: {ref!r}")
+    # The SSRF check only applies to a network destination. `https` is the
+    # only scheme ALLOWED_GIT_SCHEMES ever carries in production; `file` is
+    # also permitted in some tests (see test_ingest.py's `origin` fixture)
+    # to exercise git-fetch logic against a local repo without a network —
+    # a file:// URL has no host and nothing for this check to resolve.
+    if scheme == "https":
+        if not parsed.hostname:
+            raise IngestError(f"repository URL has no host: {remote_url!r}")
+        _resolve_and_block_private_hosts(parsed.hostname)
 
 
 def materialize_github(remote_url: str, ref: str | None) -> MaterializedCheckout:

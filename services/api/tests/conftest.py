@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import time
 import uuid
 from collections.abc import Callable, Iterator
@@ -218,3 +219,17 @@ def _no_live_embedding_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     tests that need a provider inject a fake one.
     """
     monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
+
+
+# --------------------------------------------- local-path ingestion in tests
+
+@pytest.fixture(autouse=True)
+def _allow_local_ingest(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Local-path ingestion is disabled unless an operator opts in
+    (`LOCAL_INGEST_ALLOWED_ROOTS`) — see `app.repository.ingest`. Every test
+    that stages a `tmp_path`/`tmp_path_factory` fixture needs it allowlisted,
+    and those always live under the system temp dir, so that is what gets
+    allowlisted here by default. A test exercising the disabled/rejected
+    paths overrides this explicitly via `monkeypatch`.
+    """
+    monkeypatch.setenv("LOCAL_INGEST_ALLOWED_ROOTS", tempfile.gettempdir())

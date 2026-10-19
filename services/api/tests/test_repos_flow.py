@@ -24,6 +24,9 @@ pytestmark = pytest.mark.skipif(
 
 TABLES = ("blobs", "edges", "nodes", "coverage", "pass_runs", "jobs", "repos")
 
+# Local-path ingestion is allowlisted for every test by default via the
+# `_allow_local_ingest` autouse fixture in conftest.py.
+
 
 @pytest.fixture
 def member(client, make_user, auth_header) -> tuple[TestClient, str]:
@@ -332,3 +335,32 @@ def test_stage_rejects_bad_sources(tmp_path, member):
 
     unknown = client.post("/repos/00000000-0000-0000-0000-000000000000/confirm", json={})
     assert unknown.status_code == 404
+
+
+def test_stage_local_path_disabled_by_default(tmp_path, member, monkeypatch):
+    monkeypatch.delenv("LOCAL_INGEST_ALLOWED_ROOTS", raising=False)
+    client, project_id = member
+
+    resp = client.post(
+        "/repos/stage",
+        params={"project_id": project_id},
+        json={"kind": "local", "local_path": str(tmp_path), "commit_sha": "x"},
+    )
+    assert resp.status_code == 400
+    assert "disabled" in resp.json()["detail"]
+
+
+def test_stage_local_path_outside_allowlist_rejected(
+    tmp_path, member, monkeypatch, tmp_path_factory
+):
+    other_root = tmp_path_factory.mktemp("not-allowed-root")
+    monkeypatch.setenv("LOCAL_INGEST_ALLOWED_ROOTS", str(other_root))
+    client, project_id = member
+
+    resp = client.post(
+        "/repos/stage",
+        params={"project_id": project_id},
+        json={"kind": "local", "local_path": str(tmp_path), "commit_sha": "x"},
+    )
+    assert resp.status_code == 400
+    assert "outside the allowed roots" in resp.json()["detail"]

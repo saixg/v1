@@ -364,3 +364,87 @@ done (packages are versioned, re-groundable); contradictions/missing info
 surfaced — done (`open_question` requirement kind, `unresolved` package
 entries); model output validated before persisting — done (citation-dropping
 extraction, retry-once `ModelService`). **Phase 4 is substantively complete.**
+
+## 2026-10-19 update: independent production-readiness audit — two unflagged security bugs found and fixed
+
+A cross-cutting audit (not one phase's close-out) read the actual code in
+`services/api`, `apps/web`, and the test/CI/deployment surface, deliberately
+not trusting this file's own narrative. Most of what this file claims as
+"done"/"verified" held up: auth is genuinely robust and fails closed, every
+route checks membership, no SQL-injection surface, secret redaction is wired
+into every path that reaches a model or storage, zip-bomb/zip-slip guards
+are real, the MCP server and LLM service make real calls with real
+cost-tracking, and the frontend is genuinely wired to real routes with no
+fake/placeholder content. The already-disclosed gaps (no DB-integration
+tests in CI, no Docker/deploy path, no rate limiting, no frontend tests, the
+`local_path`/migration-history-drift notes above) checked out as accurately
+self-reported, not overclaimed.
+
+**Two severe bugs were found that this file never flagged, both in
+already-shipped Phase 0/1 ingestion code:**
+
+1. **This file's own §75 claim ("SSRF... guards") for ingestion was wrong.**
+   `_validate_remote` (`app/repository/ingest.py`) only ever checked the URL
+   scheme and blocked `-`-prefixed option injection — it never resolved or
+   checked the destination host. A git URL resolving to `169.254.169.254`
+   (cloud metadata) or an internal `10.x`/`172.16.x`/`192.168.x` address
+   passed the old check and would have been `git clone`'d by the server.
+2. **Arbitrary host filesystem read via `POST /repos/stage` with a `local`
+   source**, never flagged anywhere in this file. Any authenticated user
+   could create their own project (instant membership, no operator/admin
+   role exists) and stage `local_path` set to any directory on the server —
+   `/etc`, `.env` files, another tenant's scratch checkout — which then got
+   scanned, chunked, and served back through search/chat/explorer.
+   `materialize_local` only checked the path existed and was a directory;
+   no containment check at all.
+
+**Fixed, verified, not assumed:**
+- SSRF: `_validate_remote` now resolves the hostname (`socket.getaddrinfo`)
+  and rejects any result in a private/loopback/link-local/metadata/reserved/
+  multicast range (`ipaddress` module), alongside the pre-existing scheme/
+  injection checks, not replacing them. **Documented, accepted residual
+  risk:** git's own HTTPS transport re-resolves the same hostname
+  independently at actual-fetch time, so a DNS-rebinding adversary
+  controlling the target domain could pass this pre-flight check with a
+  public IP and rebind to a private one microseconds later. Shipped as
+  note-and-ship (large improvement over no check at all; a full fix needs
+  IP-pinning via a filtering proxy or `curl --resolve`, a materially larger
+  change) — user-confirmed tradeoff, not picked silently.
+- Local-path ingestion: new `LOCAL_INGEST_ALLOWED_ROOTS` env var
+  (`;`-separated absolute directories), **unset by default → the capability
+  is disabled entirely**. `materialize_local` now resolves with
+  `Path.resolve(strict=True)` (so a symlink's real target is what gets
+  checked, closing a symlink-escape route into the bargain) and requires
+  containment in one of the configured roots, reusing the same
+  `is_relative_to` pattern `is_scratch_checkout` already used in this file.
+  This is a behavior change for every existing caller (today: works for any
+  project member; after: works for nobody until an operator opts in) —
+  user-confirmed, not picked silently.
+- New tests: `services/api/tests/test_ingest_git_remote.py` (9 cases: IPv4/
+  IPv6 literal rejection, hostname-resolves-to-private-IP via a mocked
+  resolver, public host allowed, scheme/injection regressions, DNS-failure
+  handling) and `services/api/tests/test_ingest_local_path.py` (8 cases:
+  disabled-by-default, outside/inside allowlist, multiple roots,
+  missing-commit-sha, missing-path, not-a-directory, symlink-escape —
+  skipped on this Windows session, where symlink creation needs elevated
+  privilege). `test_repos_flow.py` updated with an autouse fixture so its
+  existing local-path tests keep exercising the real route under the new
+  default-closed behavior, plus two new end-to-end rejection tests.
+- `uv run ruff check .` / `uv run pyright` clean. New unit tests: 21 passed,
+  1 skipped (symlink, platform-gated). `test_repos_flow.py` against the live
+  DB: 6 passed (the 2 pre-existing local-path tests still work with the env
+  var set, the 2 new rejection tests pass).
+
+**Found, not yet fixed — deferred to Phase 6 ("Hardening & launch") per
+build-plan.md's own schedule, by user decision:** no rate limiting/abuse
+protection anywhere beyond `llm_calls` recording cost after the fact; no
+Docker/deployment artifact or documented manual deploy procedure; CI never
+runs the DB-integration test subset (only ever run locally against a live
+Supabase instance); zero frontend automated tests; no connection pooling in
+`app/knowledge/db.py` (a fresh `psycopg.connect()` per request); the
+pre-existing migration-history-drift note above, still unresolved;
+`DELETE /repos/{repo_id}` has no UI entry point; one labeled
+`NotYetComputed` stub remains in `Inspector.tsx` ("Control-flow summaries").
+None of these are security-severity like the two above — they're real
+production-readiness gaps, correctly sequenced to Phase 6 rather than
+blocking Phase 5.
