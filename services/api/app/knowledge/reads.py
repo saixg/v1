@@ -156,10 +156,14 @@ def neighborhood(
                 clauses.append("kind = any(%s)")
                 params.append(kinds)
             peek_query = f"select 1 from codeaxis.edges where {' and '.join(clauses)} limit 1"
-            truncated = (
-                cur.execute(peek_query, params).fetchone()  # pyright: ignore[reportArgumentType]
-                is not None
-            )
+            # A plain cursor, not `cur`: `cur` builds `Edge` rows, and a
+            # `select 1` row fails Edge validation the moment the peek finds
+            # anything (i.e. whenever the walk really was truncated).
+            with conn.cursor() as peek:
+                truncated = (
+                    peek.execute(peek_query, params).fetchone()  # pyright: ignore[reportArgumentType]
+                    is not None
+                )
 
     with conn.cursor(row_factory=class_row(Node)) as cur:
         nodes_out = cur.execute(

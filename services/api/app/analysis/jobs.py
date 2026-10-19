@@ -14,6 +14,8 @@ import logging
 import shutil
 from pathlib import Path
 
+import psycopg
+
 from app.knowledge import (
     create_repo,
     finish_pass_run,
@@ -141,6 +143,43 @@ def run_scan_job(
         return
     with worker_connection() as conn:
         set_job_status(conn, job_id, JobStatus.SUCCEEDED)
+
+
+LEDGER_ANALYZER = "constraint-ledger"
+LEDGER_ANALYZER_VERSION = "0.1.0"
+
+
+def write_ledger_pass_run(conn: psycopg.Connection, repo_id: str, commit_sha: str) -> None:
+    """Run the Constraint Ledger detector under its own `pass_run`.
+
+    Same contract as `write_semantic_pass`: appended after the scan pass_run is
+    already closed as succeeded, records its own outcome, and never raises --
+    a ledger failure leaves a failed pass_run with the error, not a failed
+    scan. (Imported lazily: `app.context` depends on `app.analysis.scan`.)"""
+    from app.context import write_ledger_pass
+
+    run = start_pass_run(
+        conn,
+        PassRun(
+            repo_id=repo_id,
+            commit_sha=commit_sha,
+            analyzer=LEDGER_ANALYZER,
+            analyzer_version=LEDGER_ANALYZER_VERSION,
+            status=PassRunStatus.RUNNING,
+        ),
+    )
+    assert run.id is not None
+    try:
+        write_ledger_pass(conn, repo_id, commit_sha)
+    except Exception as exc:  # noqa: BLE001 - recorded, never propagated
+        logger.exception("constraint ledger pass failed for repo %s", repo_id)
+        try:
+            conn.rollback()
+        except Exception:  # noqa: BLE001
+            logger.exception("rollback after ledger failure failed")
+        finish_pass_run(conn, run.id, PassRunStatus.FAILED, error=str(exc) or type(exc).__name__)
+        return
+    finish_pass_run(conn, run.id, PassRunStatus.SUCCEEDED)
 
 
 def run_scan_pass(
@@ -304,4 +343,10 @@ def _run_scan_pass(
         # app/analysis/semantic/writer.py.
         write_semantic_pass(conn, repo_id, commit_sha)
         # --- end Pass 2b ----------------------------------------------------
+
+        # --- Constraint Ledger (build-plan.md Part 4.F.8) -------------------
+        # After the semantic pass so the deterministic conventions it writes
+        # are visible to the detector. Its own pass_run, and never raises.
+        write_ledger_pass_run(conn, repo_id, commit_sha)
+        # --- end Constraint Ledger ------------------------------------------
 

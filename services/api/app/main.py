@@ -57,6 +57,7 @@ from app.auth import (
     require_project_member,
     require_uuid,
 )
+from app.context_api import router as context_router
 from app.knowledge import (
     JobAlreadyExistsError,
     api_connection,
@@ -95,6 +96,7 @@ from app.llm import (
     anthropic_model_service,
 )
 from app.logging import RequestLoggingMiddleware, configure_logging
+from app.mcp_server import router as mcp_router
 from app.models import ChatMessage, ChatThread, IngestSource, Job, ProjectWithRole, Repo
 from app.repository.ingest import ZIP_LIMITS, IngestError, MaterializedCheckout
 
@@ -103,6 +105,11 @@ configure_logging()
 app = FastAPI(title="CodeAxis API")
 
 app.add_middleware(RequestLoggingMiddleware)
+
+# Agent Context Engine (tasks, ledger, packages, tokens) and its read-only MCP
+# endpoint. Each module authorizes in app code; see their docstrings.
+app.include_router(context_router)
+app.include_router(mcp_router)
 
 app.add_middleware(
     CORSMiddleware,
