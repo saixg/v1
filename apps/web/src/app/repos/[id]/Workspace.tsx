@@ -8,14 +8,16 @@ import { AskView } from "@/components/AskView";
 import { CoverageView } from "@/components/CoverageView";
 import { Explorer } from "@/components/Explorer";
 import { Inspector } from "@/components/Inspector";
+import { TaskView } from "@/components/TaskView";
 import { getSymbol, type Citation, type GraphNode } from "@/lib/api";
 
-type Tab = "explore" | "ask" | "coverage";
+type Tab = "explore" | "ask" | "coverage" | "context";
 
 const TAB_LABELS: Record<Tab, string> = {
   explore: "Explore",
   ask: "Ask",
   coverage: "Coverage",
+  context: "Context",
 };
 
 export function Workspace() {
@@ -61,7 +63,7 @@ export function Workspace() {
           <span>Pass 1: files and symbol definitions. Nothing was executed.</span>
         </div>
         <div className="flex gap-1" role="tablist" aria-label="Workspace view">
-          {(["explore", "ask", "coverage"] as const).map((t) => (
+          {(["explore", "ask", "coverage", "context"] as const).map((t) => (
             <button
               key={t}
               type="button"
@@ -80,6 +82,10 @@ export function Workspace() {
       {tab === "coverage" ? (
         <section aria-label="Coverage" className="min-h-0 flex-1 overflow-auto">
           <CoverageView repoId={id} commitSha={commitSha} />
+        </section>
+      ) : tab === "context" ? (
+        <section aria-label="Agent context" className="min-h-0 flex-1 overflow-auto">
+          <TaskView repoId={id} commitSha={commitSha} onOpenCitation={openCitation} />
         </section>
       ) : tab === "ask" ? (
         <section aria-label="Ask this codebase" className="min-h-0 flex-1 overflow-auto">

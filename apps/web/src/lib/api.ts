@@ -191,7 +191,9 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+/** One authenticated fetch with the shared error handling. Callers decide
+ * how to read a success body (JSON, text, or nothing for a 204). */
+async function send(path: string, init?: RequestInit): Promise<Response> {
   let resp: Response;
   try {
     const auth = await authHeader();
@@ -215,12 +217,21 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     }
     throw new ApiError(resp.status, detail, payload);
   }
-  return (await resp.json()) as T;
+  return resp;
 }
 
-function json(body: unknown): RequestInit {
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  return (await (await send(path, init)).json()) as T;
+}
+
+/** For routes that answer 204 No Content. */
+async function requestEmpty(path: string, init?: RequestInit): Promise<void> {
+  await send(path, init);
+}
+
+function json(body: unknown, method: "POST" | "PATCH" = "POST"): RequestInit {
   return {
-    method: "POST",
+    method,
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   };
@@ -562,4 +573,549 @@ export function recallStagedRaw(repoId: string): string | null {
   } catch {
     return null;
   }
+}
+
+// ------------------------------------------------------------ context engine
+// Phase 4 Agent Context Engine. Shapes mirror services/api/app/context_api.py
+// and the pydantic records in app/models/schemas.py. Everything the server
+// derives is static analysis; none of it was observed by running the program.
+
+/** How a stored record came to exist. `inferred` is a model's observation,
+ * never a parsed fact. */
+export type OriginTag = "parsed" | "configured" | "inferred";
+
+/** app.models.ContextEvidence */
+export interface ContextEvidence {
+  spans: Citation[];
+  node_ids: number[];
+  chunk_ids: number[];
+  documents: Record<string, string>[];
+  notes: string | null;
+  truncated: boolean;
+}
+
+export type TaskStatus = "draft" | "extracting" | "ready" | "blocked" | "archived";
+
+export interface Task {
+  id: string | null;
+  project_id: string;
+  repo_id: string;
+  commit_sha: string;
+  title: string;
+  intent: string | null;
+  status: TaskStatus;
+  created_by: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export type RequirementKind =
+  | "objective"
+  | "functional"
+  | "technical"
+  | "architectural"
+  | "existing_behavior"
+  | "acceptance_criteria"
+  | "open_question";
+
+export type RequirementStatus = "open" | "ambiguous" | "unresolved" | "satisfied" | "rejected";
+
+export interface Requirement {
+  id: string | null;
+  task_id: string;
+  repo_id: string;
+  commit_sha: string;
+  kind: RequirementKind;
+  statement: string;
+  priority: "must" | "should" | "could" | null;
+  status: RequirementStatus;
+  question: string | null;
+  origin: OriginTag;
+  source_ref: Record<string, unknown>;
+  evidence: ContextEvidence;
+  ordinal: number;
+  confidence: number | null;
+  model: string | null;
+  analyzer: string;
+  analyzer_version: string;
+  created_at: string | null;
+}
+
+export type ConstraintKind =
+  | "public_api"
+  | "db_schema"
+  | "auth_boundary"
+  | "ci_lint"
+  | "do_not_touch"
+  | "dependency"
+  | "performance"
+  | "other";
+
+export const CONSTRAINT_KINDS: readonly ConstraintKind[] = [
+  "public_api",
+  "db_schema",
+  "auth_boundary",
+  "ci_lint",
+  "do_not_touch",
+  "dependency",
+  "performance",
+  "other",
+];
+
+export interface Constraint {
+  id: string | null;
+  task_id: string | null;
+  repo_id: string;
+  commit_sha: string;
+  kind: ConstraintKind;
+  scope: string;
+  statement: string;
+  severity: "hard" | "soft";
+  source: "user_stated" | "auto_detected";
+  origin: OriginTag;
+  confirmed: boolean;
+  confirmed_by: string | null;
+  confirmed_at: string | null;
+  rationale: string | null;
+  evidence: ContextEvidence;
+  analyzer: string | null;
+  analyzer_version: string | null;
+  created_at: string | null;
+}
+
+export interface ConstraintInput {
+  kind: ConstraintKind;
+  scope: string;
+  statement: string;
+  severity: "hard" | "soft";
+  rationale?: string | null;
+}
+
+export interface Decision {
+  id: string | null;
+  task_id: string;
+  commit_sha: string;
+  question: string;
+  decision: string | null;
+  status: "open" | "decided" | "superseded";
+  locked: boolean;
+  decided_by: string | null;
+  decided_at: string | null;
+  rationale: string | null;
+  origin: OriginTag;
+  evidence: ContextEvidence;
+  analyzer: string;
+  analyzer_version: string;
+}
+
+export interface TaskSnapshot {
+  id: number | null;
+  task_id: string;
+  commit_sha: string;
+  status: "active" | "stale" | "superseded";
+  reason: string | null;
+  created_at: string | null;
+}
+
+export type ContextItemKind =
+  | "task_intent"
+  | "constraint"
+  | "requirement"
+  | "architecture"
+  | "code"
+  | "convention"
+  | "test"
+  | "limitation"
+  | "open_question";
+
+export interface ContextItem {
+  id: string | null;
+  task_id: string;
+  package_id: string | null;
+  commit_sha: string;
+  kind: ContextItemKind;
+  content: string;
+  origin: OriginTag;
+  evidence: ContextEvidence;
+  token_count: number;
+  ordinal: number;
+  analyzer: string;
+  analyzer_version: string;
+}
+
+export type ContextPackageStatus = "assembled" | "stale" | "invalid";
+
+/** One section row of `package.manifest.sections`. */
+export interface ManifestSection {
+  kind: ContextItemKind;
+  truncatable: boolean;
+  allocated: number | null;
+  used: number;
+  included: number;
+  dropped: number;
+  dropped_items: { ref: string; tokens: number }[];
+  dropped_by_retrieval?: number;
+}
+
+export interface PackageManifest {
+  order?: ContextItemKind[];
+  budget?: {
+    token_budget: number;
+    fixed_tokens: number;
+    tail_budget: number;
+    tail_used: number;
+  };
+  sections?: ManifestSection[];
+  dropped_total?: number;
+}
+
+/** `package.retrieval`: the retrieval stages behind the code section. */
+export interface PackageRetrieval {
+  pipeline?: string;
+  seed_symbols?: number;
+  grounded_files?: number;
+  stages?: StageOutcome[];
+  token_budget?: number;
+  tokens_used?: number;
+  fused_candidates?: number;
+  dropped_for_budget?: number;
+}
+
+/** One `package.unresolved` entry. `kind` is open-ended (for example
+ * `constraints_exceed_budget`, `open_decision`, `unmatched_path`), so the
+ * remaining keys stay readable but untyped. */
+export interface UnresolvedEntry {
+  kind: string;
+  detail?: string;
+  ref?: string;
+  [key: string]: unknown;
+}
+
+export interface ContextPackage {
+  id: string | null;
+  task_id: string;
+  commit_sha: string;
+  version: number;
+  status: ContextPackageStatus;
+  token_budget: number;
+  token_count: number;
+  manifest: PackageManifest;
+  retrieval: PackageRetrieval;
+  unresolved: UnresolvedEntry[];
+  analyzer: string;
+  analyzer_version: string;
+  created_at: string | null;
+}
+
+export interface PackageFreshnessSummary {
+  package_id: string | null;
+  version: number;
+  commit_sha: string;
+  status: ContextPackageStatus;
+  state: "current" | "stale";
+  reason: string | null;
+  created_at: string | null;
+}
+
+export interface PinnedRecord {
+  kind: "requirement" | "constraint" | "task_component";
+  ref: string;
+  commit_sha: string;
+}
+
+export interface TaskState {
+  analysis: "static";
+  notice: string;
+  task: Task;
+  active_snapshot: TaskSnapshot | null;
+  snapshots: TaskSnapshot[];
+  requirements: Requirement[];
+  constraints: Constraint[];
+  decisions: Decision[];
+  packages: PackageFreshnessSummary[];
+  latest_package: PackageFreshnessSummary | null;
+  current_package_id: string | null;
+  pinned_elsewhere: PinnedRecord[];
+  problems: string[];
+}
+
+export interface DocumentPreview {
+  task_id: string;
+  /** Always false: the preview persists nothing. */
+  stored: boolean;
+  documents: { name: string; chunks: number; secrets_redacted: number }[];
+  images: { chunk_id: string | number; name: string }[];
+  secrets_redacted: number;
+  unreadable: unknown[];
+}
+
+export interface DroppedOutput {
+  key: string | null;
+  kind: string;
+  reason: string;
+  detail: string;
+}
+
+export interface ExtractionResult {
+  task_id: string;
+  task_status: TaskStatus;
+  requirements: Requirement[];
+  dropped: DroppedOutput[];
+  constraint_conflicts: {
+    requirement_key: string;
+    constraint_id: string | null;
+    constraint_kind: string;
+    scope: string;
+    path: string;
+    confirmed: boolean;
+    severity: string;
+  }[];
+  contradictions: { first: string; second: string; explanation: string }[];
+  /** "ran" | "skipped_by_caller" | "not_run" */
+  contradiction_check: string;
+  secrets_redacted: number;
+  unreadable: unknown[];
+}
+
+export interface ContextPackageResponse {
+  analysis: "static";
+  notice: string;
+  package: ContextPackage;
+  freshness: { state: "current" | "stale"; current: boolean; reason: string | null };
+  items: ContextItem[];
+}
+
+export type ExportFormat = "claude_md" | "agents_md" | "context_md";
+
+export interface ExportedFile {
+  filename: string;
+  markdown: string;
+  packageStatus: string | null;
+  snapshot: string | null;
+}
+
+/** The 409 body when an export is refused because the package is stale or
+ * invalid. The caller may opt in with `allow_stale`. */
+export interface PackageNotCurrent {
+  error: "package_not_current";
+  package_status: string;
+  reason: string;
+  detail: string;
+}
+
+export function isPackageNotCurrent(detail: unknown): detail is PackageNotCurrent {
+  return (
+    typeof detail === "object" &&
+    detail !== null &&
+    (detail as { error?: unknown }).error === "package_not_current"
+  );
+}
+
+/** 502 bodies from extraction: the previous requirements were left as they were. */
+export interface ModelFailure {
+  error: "model_output_invalid" | "model_call_failed";
+  detail: string;
+  task_id: string;
+}
+
+export function isModelFailure(detail: unknown): detail is ModelFailure {
+  if (typeof detail !== "object" || detail === null) return false;
+  const e = (detail as { error?: unknown }).error;
+  return e === "model_output_invalid" || e === "model_call_failed";
+}
+
+export interface RegroundReport {
+  previous_commit_sha: string;
+  snapshot: TaskSnapshot;
+  stale_package_ids: string[];
+  needs_rederivation: PinnedRecord[];
+}
+
+export interface ApiTokenRecord {
+  id: string | null;
+  repo_id: string;
+  name: string;
+  token_prefix: string;
+  scope: "read";
+  created_at: string | null;
+  last_used_at: string | null;
+  expires_at: string | null;
+  revoked_at: string | null;
+}
+
+export interface IssuedToken {
+  token: string;
+  shown_once: boolean;
+  record: ApiTokenRecord;
+  mcp_url_path: string;
+}
+
+const taskPath = (taskId: string) => `/tasks/${encodeURIComponent(taskId)}`;
+const repoPath = (repoId: string) => `/repos/${encodeURIComponent(repoId)}`;
+
+export function createTask(
+  repoId: string,
+  title: string,
+  intent: string,
+  commitSha?: string,
+): Promise<Task> {
+  const body: Record<string, unknown> = { title, intent };
+  if (commitSha) body.commit_sha = commitSha;
+  return request(`${repoPath(repoId)}/tasks`, json(body));
+}
+
+export function getTaskState(taskId: string): Promise<TaskState> {
+  return request(taskPath(taskId));
+}
+
+export function previewDocuments(
+  taskId: string,
+  files: File[],
+  includeImages: boolean,
+): Promise<DocumentPreview> {
+  const form = new FormData();
+  for (const f of files) form.append("files", f);
+  form.append("include_images", String(includeImages));
+  return request(`${taskPath(taskId)}/documents`, { method: "POST", body: form });
+}
+
+export function extractRequirements(
+  taskId: string,
+  files: File[],
+  opts: { includeImages: boolean; checkContradictions: boolean },
+): Promise<ExtractionResult> {
+  const form = new FormData();
+  for (const f of files) form.append("files", f);
+  form.append("include_images", String(opts.includeImages));
+  form.append("check_contradictions", String(opts.checkContradictions));
+  return request(`${taskPath(taskId)}/requirements/extract`, { method: "POST", body: form });
+}
+
+export function listTaskConstraints(
+  taskId: string,
+): Promise<{ commit_sha: string; constraints: Constraint[] }> {
+  return request(`${taskPath(taskId)}/constraints`);
+}
+
+export function createConstraint(taskId: string, input: ConstraintInput): Promise<Constraint> {
+  return request(`${taskPath(taskId)}/constraints`, json(input));
+}
+
+export function patchConstraint(
+  taskId: string,
+  constraintId: string,
+  patch: Partial<ConstraintInput>,
+): Promise<Constraint> {
+  return request(
+    `${taskPath(taskId)}/constraints/${encodeURIComponent(constraintId)}`,
+    json(patch, "PATCH"),
+  );
+}
+
+export function deleteConstraint(taskId: string, constraintId: string): Promise<void> {
+  return requestEmpty(`${taskPath(taskId)}/constraints/${encodeURIComponent(constraintId)}`, {
+    method: "DELETE",
+  });
+}
+
+export function confirmConstraint(
+  taskId: string,
+  constraintId: string,
+  confirmed = true,
+): Promise<Constraint> {
+  return request(
+    `${taskPath(taskId)}/constraints/${encodeURIComponent(constraintId)}/confirm`,
+    json({ confirmed }),
+  );
+}
+
+/** Repo-wide ledger: auto-detected and repo-level entries only. */
+export function getRepoLedger(
+  repoId: string,
+  commitSha?: string,
+): Promise<{ analysis: "static"; commit_sha: string; constraints: Constraint[] }> {
+  const q = commitSha ? `?${qs({ commit_sha: commitSha })}` : "";
+  return request(`${repoPath(repoId)}/constraints${q}`);
+}
+
+export function resolveDecision(
+  taskId: string,
+  decisionId: string,
+  decision: string,
+  rationale?: string,
+): Promise<Decision> {
+  const body: Record<string, unknown> = { decision };
+  if (rationale) body.rationale = rationale;
+  return request(
+    `${taskPath(taskId)}/decisions/${encodeURIComponent(decisionId)}/resolve`,
+    json(body),
+  );
+}
+
+export function assembleContext(
+  taskId: string,
+  tokenBudget: number,
+): Promise<ContextPackageResponse> {
+  return request(`${taskPath(taskId)}/context`, json({ token_budget: tokenBudget }));
+}
+
+export function getContextPackage(taskId: string): Promise<ContextPackageResponse> {
+  return request(`${taskPath(taskId)}/context`);
+}
+
+/** Fetches the rendered markdown. A stale or invalid package is refused with
+ * a 409 whose `detail` satisfies `isPackageNotCurrent`; retry with
+ * `allowStale` only when the person has chosen to. The file name is the
+ * server's, from Content-Disposition. */
+export async function exportContext(
+  taskId: string,
+  format: ExportFormat,
+  allowStale = false,
+): Promise<ExportedFile> {
+  const resp = await send(
+    `${taskPath(taskId)}/export?${qs({ format, allow_stale: String(allowStale) })}`,
+  );
+  const type = resp.headers.get("Content-Type") ?? "";
+  if (!type.startsWith("text/markdown")) {
+    throw new ApiError(resp.status, `Unexpected export content type: ${type || "none"}`);
+  }
+  const disposition = resp.headers.get("Content-Disposition") ?? "";
+  const match = /filename="([^"]+)"/.exec(disposition);
+  return {
+    filename: match ? match[1] : "context.md",
+    markdown: await resp.text(),
+    packageStatus: resp.headers.get("X-CodeAxis-Package-Status"),
+    snapshot: resp.headers.get("X-CodeAxis-Snapshot"),
+  };
+}
+
+export function regroundTask(
+  taskId: string,
+  commitSha: string,
+  reason: string,
+): Promise<RegroundReport> {
+  return request(`${taskPath(taskId)}/reground`, json({ commit_sha: commitSha, reason }));
+}
+
+export function createApiToken(
+  repoId: string,
+  name: string,
+  expiresInDays?: number,
+): Promise<IssuedToken> {
+  const body: Record<string, unknown> = { name };
+  if (expiresInDays !== undefined) body.expires_in_days = expiresInDays;
+  return request(`${repoPath(repoId)}/api-tokens`, json(body));
+}
+
+export function listApiTokens(
+  repoId: string,
+  includeRevoked = false,
+): Promise<{ tokens: ApiTokenRecord[] }> {
+  return request(`${repoPath(repoId)}/api-tokens?${qs({ include_revoked: String(includeRevoked) })}`);
+}
+
+export function revokeApiToken(repoId: string, tokenId: string): Promise<void> {
+  return requestEmpty(`${repoPath(repoId)}/api-tokens/${encodeURIComponent(tokenId)}`, {
+    method: "DELETE",
+  });
 }

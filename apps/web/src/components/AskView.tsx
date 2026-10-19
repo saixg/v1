@@ -47,7 +47,7 @@ function citationLabel(c: Citation): string {
   return `${c.path}:${span}`;
 }
 
-function CitationChip({
+export function CitationChip({
   citation,
   onOpen,
 }: {
@@ -82,7 +82,7 @@ function CitationChip({
   );
 }
 
-function Stages({ stages, budget }: { stages: StageOutcome[]; budget: RetrievalBudget }) {
+export function Stages({ stages, budget }: { stages: StageOutcome[]; budget: RetrievalBudget }) {
   return (
     <div className="space-y-1 text-[11px] text-muted">
       <ul className="flex flex-wrap gap-x-3 gap-y-1">
