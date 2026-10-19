@@ -132,12 +132,14 @@ class JobStatus(str, Enum):  # noqa: UP042 — str mixin kept for psycopg param 
     FAILED = "failed"
 
 
-JobKind = Literal["scan"]
+JobKind = Literal["scan", "blueprint_generate", "blueprint_regenerate"]
 
 
 class Job(BaseModel):
     """codeaxis.jobs: one long-running request a user started. A `scan` job
-    drives exactly one scan pass_run for its repo."""
+    drives exactly one scan pass_run for its repo; the two blueprint kinds
+    drive one model-backed design pass each (Part 8: anything long returns a
+    job id and is polled)."""
 
     id: RepoId
     project_id: RepoId
@@ -950,3 +952,258 @@ class IssuedApiToken(BaseModel):
 
     token: str
     record: ApiToken
+
+
+# ----------------------------------------------------------------------------
+# Virtual Development Environment (Part 4.G, Part 6 "Virtual env", Phase 5).
+#
+# A deliberately separate vocabulary from `NodeKind`/`EdgeKind`: those name
+# facts an analyzer established about code that exists, these name a design a
+# model proposed for code that does not. Part 13 decision #4 locks this
+# taxonomy; `supabase/migrations/20261021000000_blueprint.sql` carries the
+# full reasoning.
+# ----------------------------------------------------------------------------
+
+# The contract `packages/schemas/blueprint.v1.json` describes. An unknown
+# value is rejected at read time rather than coerced (Part 4.G.5).
+BLUEPRINT_SCHEMA_VERSION = "1.0.0"
+
+# What a component is relative to the repo as it stands.
+BlueprintComponentKind = Literal["existing", "proposed", "modified"]
+# What the design does to it. Paired with `kind`, never independent of it:
+# existing+reuse, modified+extend, proposed+new (enforced in SQL and below).
+BlueprintMapping = Literal["reuse", "extend", "new"]
+KIND_TO_MAPPING: dict[str, str] = {
+    "existing": "reuse",
+    "modified": "extend",
+    "proposed": "new",
+}
+
+# Replaces `OriginTag` for blueprint rows: none of parsed/configured/inferred
+# honestly describes "a model authored this design", and `locked` is a state
+# the regeneration pass must be able to refuse to overwrite (Part 4.G.9).
+BlueprintGenerationStatus = Literal["generated", "edited", "locked"]
+
+BlueprintVersionStatus = Literal["draft", "validated", "invalid", "approved"]
+BlueprintVersionReason = Literal["generated", "regenerated", "edited", "validated"]
+
+# `dependency` is the only kind a cycle is invalid in: control flow, data
+# flow and events legitimately loop (retries, polling, pub/sub).
+BlueprintConnectionKind = Literal["control_flow", "data_flow", "dependency", "event"]
+ProposedFileStatus = Literal["new", "modified", "unchanged"]
+
+
+class BlueprintInterface(BaseModel):
+    """One entry point a component exposes. Not a node in the graph: an
+    interface has no identity outside the component that declares it."""
+
+    name: str = Field(min_length=1)
+    kind: Literal["api", "event", "function"]
+    # Free text: the signature's shape differs per language and per kind, and
+    # a parsed signature here would imply a precision the generator does not
+    # have for code that does not exist yet.
+    signature: str | None = None
+
+
+class ValidationError(BaseModel):
+    """One reason a blueprint is invalid. Stored, not recomputed: Part 4.G.5
+    requires an invalid blueprint to be rejected *with reasons*, and a reason
+    that only existed during the failing run cannot be shown to anyone."""
+
+    code: str = Field(min_length=1)
+    message: str = Field(min_length=1)
+    # Which row it is about, when it is about one.
+    entity_kind: Literal["component", "connection", "proposed_file", "blueprint"] | None = None
+    entity_key: str | None = None
+
+
+class Blueprint(BaseModel):
+    """codeaxis.blueprints: one design effort, grounded against one snapshot
+    of one repo and hanging off one Context Engine task.
+
+    `task_id` is required (Part 13 decision #4, sub-decision C): Part 4.G.1
+    begins from extracted objective/requirements/constraints, which are
+    Pillar 2's records, so a blueprint references `codeaxis.requirements` /
+    `constraints` / `decisions` instead of copying them.
+    """
+
+    id: RepoId | None = None
+    project_id: RepoId
+    repo_id: RepoId
+    commit_sha: str
+    task_id: RepoId
+    title: str = Field(min_length=1, max_length=300)
+    current_version_id: RepoId | None = None
+    created_by: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class BlueprintVersion(BaseModel):
+    """codeaxis.blueprint_versions: one immutable snapshot of a design.
+
+    Append-only in the same way `ContextPackage` is: an edit, a regeneration
+    or a validation outcome creates a new version rather than mutating one,
+    so an exported context package can always be traced to the exact design
+    it came from (Part 4.G.9).
+    """
+
+    id: RepoId | None = None
+    blueprint_id: RepoId
+    version: int = Field(ge=1)
+    schema_version: str = BLUEPRINT_SCHEMA_VERSION
+    status: BlueprintVersionStatus = "draft"
+    validation_errors: list[ValidationError] = []
+    origin_reason: BlueprintVersionReason = "generated"
+    analyzer: str
+    analyzer_version: str
+    created_by: str | None = None
+    created_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def _invalid_states_its_reasons(self) -> BlueprintVersion:
+        if self.status == "invalid" and not self.validation_errors:
+            raise ValueError("an invalid blueprint version must carry its validation errors")
+        if self.status == "validated" and self.validation_errors:
+            raise ValueError("a validated blueprint version cannot carry validation errors")
+        return self
+
+
+class BlueprintComponent(BaseModel):
+    """codeaxis.blueprint_components: one capability in the design.
+
+    `key` is the stable identity across versions — connections and proposed
+    files reference it by `key`, not by `id`, because a new version
+    re-inserts rows and Part 4.G.9 requires untouched parts of the design to
+    survive a partial regeneration unchanged.
+    """
+
+    id: RepoId | None = None
+    blueprint_version_id: RepoId | None = None
+    key: str = Field(min_length=1, max_length=200)
+    name: str = Field(min_length=1, max_length=300)
+    kind: BlueprintComponentKind
+    mapping: BlueprintMapping
+    # The real `cluster`-kind node this maps to (Part 4.G.3, Part 11:
+    # "existing components map to real entities"). Finer-grained targets —
+    # the exact file or symbol to extend — ride in `evidence`.
+    linked_component_id: int | None = None
+    repo_id: RepoId
+    commit_sha: str
+    module_key: str | None = None
+    responsibility: str | None = None
+    interfaces: list[BlueprintInterface] = []
+    confidence: float | None = Field(default=None, ge=0, le=1)
+    # Reused unchanged from the context engine so the existing citation
+    # validator checks these spans too, rather than a parallel shape.
+    evidence: ContextEvidence = ContextEvidence()
+    generation_status: BlueprintGenerationStatus = "generated"
+    locked: bool = False
+    created_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def _taxonomy_invariants(self) -> BlueprintComponent:
+        if KIND_TO_MAPPING[self.kind] != self.mapping:
+            raise ValueError(
+                f"kind={self.kind!r} pairs with mapping={KIND_TO_MAPPING[self.kind]!r}, "
+                f"not {self.mapping!r}"
+            )
+        if self.kind != "proposed" and self.linked_component_id is None:
+            raise ValueError(
+                f"a {self.kind!r} component must name the repo entity it maps to "
+                "(linked_component_id)"
+            )
+        if self.locked != (self.generation_status == "locked"):
+            raise ValueError("`locked` and generation_status='locked' are one fact, not two")
+        return self
+
+
+class BlueprintConnection(BaseModel):
+    """codeaxis.blueprint_connections: one relationship between two
+    components, named by their stable keys.
+
+    The canonical JSON's `data_flows` is this filtered to
+    `kind == 'data_flow'` at read time — one stored edge, so a data flow can
+    never drift from the connection it describes.
+    """
+
+    id: RepoId | None = None
+    blueprint_version_id: RepoId | None = None
+    key: str = Field(min_length=1, max_length=200)
+    kind: BlueprintConnectionKind
+    source_key: str = Field(min_length=1)
+    target_key: str = Field(min_length=1)
+    # {protocol, trigger, description}
+    semantics: dict = {}
+    # Only meaningful on a data flow.
+    data_shape: dict | None = None
+    locked: bool = False
+    created_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def _endpoints_and_shape(self) -> BlueprintConnection:
+        if self.source_key == self.target_key:
+            raise ValueError("a connection must join two different components")
+        if self.kind != "data_flow" and self.data_shape is not None:
+            raise ValueError("data_shape belongs to a data_flow connection")
+        return self
+
+
+class ProposedFile(BaseModel):
+    """codeaxis.proposed_files: one file the design would add or change
+    (Part 4.G.7). Every file states a purpose; `conventions_refs` names the
+    `codeaxis.conventions` rows that justified its path and shape, and an
+    empty list is shown as an uncited placement rather than hidden."""
+
+    id: RepoId | None = None
+    blueprint_version_id: RepoId | None = None
+    path: str = Field(min_length=1)
+    status: ProposedFileStatus
+    purpose: str = Field(min_length=1)
+    implements_component_key: str | None = None
+    conventions_refs: list[int] = []
+    locked: bool = False
+    created_at: datetime | None = None
+
+
+class BlueprintLayout(BaseModel):
+    """codeaxis.blueprint_layouts: where the boxes sit (Part 4.G.6).
+
+    Stored apart from semantics and keyed by component/connection `key`, so
+    dragging a box neither creates a new version of the design nor breaks
+    when the rows it positions are regenerated.
+    """
+
+    blueprint_version_id: RepoId
+    layout: dict = {}
+    updated_at: datetime | None = None
+
+
+class BlueprintDocument(BaseModel):
+    """The canonical blueprint JSON (Part 6), assembled for one version.
+
+    This is a *read* shape: the tables are the source of truth, and this is
+    what the API serves and what an export renders from. `data_flows` is
+    derived here rather than stored.
+    """
+
+    schema_version: str = BLUEPRINT_SCHEMA_VERSION
+    blueprint: Blueprint
+    version: BlueprintVersion
+    components: list[BlueprintComponent] = []
+    connections: list[BlueprintConnection] = []
+    proposed_files: list[ProposedFile] = []
+    layout: dict = {}
+    # Referenced, never copied: the context engine owns these records, and
+    # duplicating them here would give a design its own divergent idea of
+    # what the requirements are.
+    requirement_ids: list[str] = []
+    constraint_ids: list[str] = []
+    # Open decisions carried rather than guessed (Part 4.G.5, Part 0.3).
+    unresolved: list[dict] = []
+
+    @property
+    def data_flows(self) -> list[BlueprintConnection]:
+        """Part 6's `data_flows`: a view over `connections`, not a second
+        collection."""
+        return [c for c in self.connections if c.kind == "data_flow"]

@@ -1,0 +1,341 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codeaxis.dev/schemas/blueprint.v1.json",
+  "title": "CodeAxis Blueprint",
+  "description": "The canonical blueprint JSON (build-plan.md Part 6, Part 4.G; Part 13 decision #4). A typed, versioned design for work on one snapshot of one repository - never a raw diagram. The database tables in supabase/migrations/20261021000000_blueprint.sql are the source of truth; this is the shape they assemble into for the API, the React Flow view and exports. Deliberately a separate vocabulary from the Repo Model's node/edge kinds: those describe code that exists, this describes a design for code that does not.",
+  "type": "object",
+  "required": ["schema_version", "blueprint", "version", "components"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "description": "An unknown value is rejected at read time, never coerced into the shape the reader expects.",
+      "const": "1.0.0"
+    },
+    "blueprint": {
+      "type": "object",
+      "required": ["id", "project_id", "repo_id", "commit_sha", "task_id", "title"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "format": "uuid" },
+        "project_id": { "type": "string", "format": "uuid" },
+        "repo_id": { "type": "string", "format": "uuid" },
+        "commit_sha": {
+          "description": "The snapshot the design was grounded against. Every claim in this document is about this commit and no other.",
+          "type": "string",
+          "minLength": 1
+        },
+        "task_id": {
+          "description": "Required: a blueprint hangs off exactly one Context Engine task, so requirements and constraints are referenced from Pillar 2 rather than duplicated here.",
+          "type": "string",
+          "format": "uuid"
+        },
+        "title": { "type": "string", "minLength": 1, "maxLength": 300 },
+        "current_version_id": { "type": ["string", "null"], "format": "uuid" },
+        "created_by": { "type": ["string", "null"] },
+        "created_at": { "type": ["string", "null"], "format": "date-time" },
+        "updated_at": { "type": ["string", "null"], "format": "date-time" }
+      }
+    },
+    "version": {
+      "type": "object",
+      "required": ["version", "status", "analyzer", "analyzer_version"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "format": "uuid" },
+        "blueprint_id": { "type": "string", "format": "uuid" },
+        "version": { "type": "integer", "minimum": 1 },
+        "schema_version": { "const": "1.0.0" },
+        "status": {
+          "description": "invalid is a first-class resting state, not an error to swallow: Part 4.G.5 requires an invalid blueprint to be rejected with its reasons attached.",
+          "enum": ["draft", "validated", "invalid", "approved"]
+        },
+        "validation_errors": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/validationError" }
+        },
+        "origin_reason": {
+          "enum": ["generated", "regenerated", "edited", "validated"]
+        },
+        "analyzer": { "type": "string", "minLength": 1 },
+        "analyzer_version": { "type": "string", "minLength": 1 },
+        "created_by": { "type": ["string", "null"] },
+        "created_at": { "type": ["string", "null"], "format": "date-time" }
+      }
+    },
+    "components": {
+      "description": "The capabilities in the design. `key` is the stable identity across versions; connections and proposed files reference components by key, never by id, so a partial regeneration can leave untouched parts alone (Part 4.G.9).",
+      "type": "array",
+      "items": { "$ref": "#/$defs/component" }
+    },
+    "connections": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/connection" }
+    },
+    "data_flows": {
+      "description": "Derived at read time from `connections` where kind == 'data_flow'. Present for readers that want it named, but it is a view, not a second stored collection - a data flow can never drift from the connection it describes.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/connection" }
+    },
+    "modules": {
+      "description": "A lightweight grouping of components by their `module_key`. A module has no identity beyond the components in it, which is why it is not a table.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["key", "components"],
+        "additionalProperties": false,
+        "properties": {
+          "key": { "type": "string", "minLength": 1 },
+          "name": { "type": ["string", "null"] },
+          "components": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
+    "proposed_files": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/proposedFile" }
+    },
+    "layout": {
+      "description": "Positions only, keyed by component/connection `key`. Stored apart from semantics (Part 4.G.6) so arranging the diagram neither creates a new version of the design nor breaks when the rows it positions are regenerated.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "nodes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["key", "x", "y"],
+            "additionalProperties": false,
+            "properties": {
+              "key": { "type": "string", "minLength": 1 },
+              "x": { "type": "number" },
+              "y": { "type": "number" },
+              "w": { "type": ["number", "null"] },
+              "h": { "type": ["number", "null"] }
+            }
+          }
+        },
+        "edges": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["key"],
+            "additionalProperties": false,
+            "properties": {
+              "key": { "type": "string", "minLength": 1 },
+              "points": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["x", "y"],
+                  "additionalProperties": false,
+                  "properties": {
+                    "x": { "type": "number" },
+                    "y": { "type": "number" }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "viewport": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "x": { "type": "number" },
+            "y": { "type": "number" },
+            "zoom": { "type": "number", "exclusiveMinimum": 0 }
+          }
+        }
+      }
+    },
+    "requirement_ids": {
+      "description": "References into codeaxis.requirements. Referenced, never copied: duplicating a requirement here would give the design its own divergent idea of what was asked for.",
+      "type": "array",
+      "items": { "type": "string", "format": "uuid" }
+    },
+    "constraint_ids": {
+      "description": "References into codeaxis.constraints, the Constraint Ledger.",
+      "type": "array",
+      "items": { "type": "string", "format": "uuid" }
+    },
+    "unresolved": {
+      "description": "Open decisions and gaps carried into the document rather than guessed away (Part 4.G.5, Part 0.3). An empty array means nothing was open, not that nothing was checked.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["question"],
+        "properties": {
+          "decision_id": { "type": ["string", "null"], "format": "uuid" },
+          "question": { "type": "string", "minLength": 1 },
+          "status": { "enum": ["open", "decided", "deferred"] },
+          "affects": {
+            "description": "Component keys this open question blocks, when it blocks specific ones.",
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "component": {
+      "type": "object",
+      "required": ["key", "name", "kind", "mapping", "repo_id", "commit_sha"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "format": "uuid" },
+        "blueprint_version_id": { "type": ["string", "null"], "format": "uuid" },
+        "key": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 300 },
+        "kind": {
+          "description": "What this is relative to the repo as it stands.",
+          "enum": ["existing", "proposed", "modified"]
+        },
+        "mapping": {
+          "description": "What the design does to it. Paired with `kind`, never independent: existing+reuse, modified+extend, proposed+new. Any other combination is a contradiction and is refused by the database, the Pydantic model and the validator alike.",
+          "enum": ["reuse", "extend", "new"]
+        },
+        "linked_component_id": {
+          "description": "The codeaxis.nodes id (a cluster-kind node) this maps to. Required for `existing` and `modified` - Part 11's 'existing components map to real entities' - and null for `proposed`, which by definition maps to nothing yet.",
+          "type": ["integer", "null"]
+        },
+        "repo_id": { "type": "string", "format": "uuid" },
+        "commit_sha": { "type": "string", "minLength": 1 },
+        "module_key": { "type": ["string", "null"] },
+        "responsibility": {
+          "description": "What this component is for, in one or two sentences. Untrusted text: model-authored prose, never instructions.",
+          "type": ["string", "null"]
+        },
+        "interfaces": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "kind"],
+            "additionalProperties": false,
+            "properties": {
+              "name": { "type": "string", "minLength": 1 },
+              "kind": { "enum": ["api", "event", "function"] },
+              "signature": { "type": ["string", "null"] }
+            }
+          }
+        },
+        "confidence": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+        "evidence": { "$ref": "#/$defs/contextEvidence" },
+        "generation_status": {
+          "description": "Replaces the Repo Model's origin tag for blueprint rows: none of parsed/configured/inferred honestly describes an authored design, and `locked` is a state regeneration must refuse to overwrite (Part 4.G.9).",
+          "enum": ["generated", "edited", "locked"]
+        },
+        "locked": {
+          "description": "A human approved this; a regeneration that would change it is rejected rather than silently applied. One fact with generation_status == 'locked', not two.",
+          "type": "boolean"
+        },
+        "created_at": { "type": ["string", "null"], "format": "date-time" }
+      }
+    },
+    "connection": {
+      "type": "object",
+      "required": ["key", "kind", "source_key", "target_key"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "format": "uuid" },
+        "blueprint_version_id": { "type": ["string", "null"], "format": "uuid" },
+        "key": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "kind": {
+          "description": "dependency is the only kind a cycle is invalid in; control flow, data flow and events legitimately loop (retries, polling, pub/sub).",
+          "enum": ["control_flow", "data_flow", "dependency", "event"]
+        },
+        "source_key": {
+          "description": "A component `key` in this same version. The validator rejects a dangling endpoint; Postgres cannot express this as a foreign key.",
+          "type": "string",
+          "minLength": 1
+        },
+        "target_key": { "type": "string", "minLength": 1 },
+        "semantics": {
+          "type": "object",
+          "properties": {
+            "protocol": { "type": ["string", "null"] },
+            "trigger": { "type": ["string", "null"] },
+            "description": { "type": ["string", "null"] }
+          }
+        },
+        "data_shape": {
+          "description": "Only meaningful on a data_flow; must be null on any other kind.",
+          "type": ["object", "null"]
+        },
+        "locked": { "type": "boolean" },
+        "created_at": { "type": ["string", "null"], "format": "date-time" }
+      }
+    },
+    "proposedFile": {
+      "type": "object",
+      "required": ["path", "status", "purpose"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "format": "uuid" },
+        "blueprint_version_id": { "type": ["string", "null"], "format": "uuid" },
+        "path": { "type": "string", "minLength": 1 },
+        "status": {
+          "description": "new must not collide with a path that already exists in the snapshot; modified and unchanged must correspond to one that does (Part 4.G.5).",
+          "enum": ["new", "modified", "unchanged"]
+        },
+        "purpose": { "type": "string", "minLength": 1 },
+        "implements_component_key": { "type": ["string", "null"] },
+        "conventions_refs": {
+          "description": "codeaxis.conventions ids that justified this path and shape (Part 4.G.7). An empty array is shown as an uncited placement rather than hidden.",
+          "type": "array",
+          "items": { "type": "integer" }
+        },
+        "locked": { "type": "boolean" },
+        "created_at": { "type": ["string", "null"], "format": "date-time" }
+      }
+    },
+    "contextEvidence": {
+      "description": "Reused unchanged from the Agent Context Engine (Part 5), so the citation validator that already checks chat answers and context items checks these spans too.",
+      "type": "object",
+      "properties": {
+        "spans": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["path", "line_start", "line_end"],
+            "properties": {
+              "path": { "type": "string" },
+              "line_start": { "type": "integer" },
+              "line_end": { "type": "integer" },
+              "symbol": { "type": ["string", "null"] },
+              "node_id": { "type": ["integer", "null"] },
+              "chunk_id": { "type": ["integer", "null"] }
+            }
+          }
+        },
+        "node_ids": { "type": "array", "items": { "type": "integer" } },
+        "chunk_ids": { "type": "array", "items": { "type": "integer" } },
+        "documents": {
+          "type": "array",
+          "items": { "type": "object", "additionalProperties": { "type": "string" } }
+        },
+        "notes": { "type": ["string", "null"] },
+        "truncated": {
+          "description": "True when inputs had to be capped to fit a budget - an admitted gap, not a silent one.",
+          "type": "boolean"
+        }
+      }
+    },
+    "validationError": {
+      "type": "object",
+      "required": ["code", "message"],
+      "additionalProperties": false,
+      "properties": {
+        "code": { "type": "string", "minLength": 1 },
+        "message": { "type": "string", "minLength": 1 },
+        "entity_kind": {
+          "enum": ["component", "connection", "proposed_file", "blueprint", null]
+        },
+        "entity_key": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

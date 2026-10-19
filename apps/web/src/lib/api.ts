@@ -165,7 +165,9 @@ export interface Job {
   id: string;
   project_id: string;
   repo_id: string | null;
-  kind: "scan";
+  /** "scan" for ingestion; blueprint jobs add their own kinds, so this is
+   * not narrowed to a literal. */
+  kind: string;
   status: JobStatus;
   error: string | null;
   created_at: string;
@@ -229,7 +231,7 @@ async function requestEmpty(path: string, init?: RequestInit): Promise<void> {
   await send(path, init);
 }
 
-function json(body: unknown, method: "POST" | "PATCH" = "POST"): RequestInit {
+function json(body: unknown, method: "POST" | "PATCH" | "PUT" = "POST"): RequestInit {
   return {
     method,
     headers: { "Content-Type": "application/json" },
@@ -1118,4 +1120,305 @@ export function revokeApiToken(repoId: string, tokenId: string): Promise<void> {
   return requestEmpty(`${repoPath(repoId)}/api-tokens/${encodeURIComponent(tokenId)}`, {
     method: "DELETE",
   });
+}
+
+// ------------------------------------------------------- virtual dev environment
+// Phase 5 blueprints. Shapes mirror packages/schemas/blueprint.v1.json (the
+// assembled document) and the /blueprints routes. A blueprint is a design for
+// code that does not exist yet; none of it was observed by running anything.
+
+export type BlueprintStatus = "draft" | "validated" | "invalid" | "approved";
+export type ComponentKind = "existing" | "proposed" | "modified";
+export type ComponentMapping = "reuse" | "extend" | "new";
+export type GenerationStatus = "generated" | "edited" | "locked";
+export type ConnectionKind = "control_flow" | "data_flow" | "dependency" | "event";
+export type ProposedFileStatus = "new" | "modified" | "unchanged";
+
+/** The only legal (kind, mapping) pairings. The database, the server model and
+ * the validator all refuse any other combination. */
+export const KIND_MAPPING: Record<ComponentKind, ComponentMapping> = {
+  existing: "reuse",
+  modified: "extend",
+  proposed: "new",
+};
+
+export interface Blueprint {
+  id: string;
+  project_id: string;
+  repo_id: string;
+  commit_sha: string;
+  task_id: string;
+  title: string;
+  current_version_id?: string | null;
+  created_by?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface BlueprintValidationError {
+  code: string;
+  message: string;
+  entity_kind?: "component" | "connection" | "proposed_file" | "blueprint" | null;
+  entity_key?: string | null;
+}
+
+export interface BlueprintVersion {
+  id?: string;
+  blueprint_id?: string;
+  version: number;
+  schema_version?: string;
+  status: BlueprintStatus;
+  validation_errors?: BlueprintValidationError[];
+  origin_reason?: "generated" | "regenerated" | "edited" | "validated";
+  analyzer: string;
+  analyzer_version: string;
+  created_by?: string | null;
+  created_at?: string | null;
+}
+
+export interface ComponentInterface {
+  name: string;
+  kind: "api" | "event" | "function";
+  signature?: string | null;
+}
+
+/** Evidence on a blueprint row; every collection may be absent. */
+export interface BlueprintEvidence {
+  spans?: Citation[];
+  node_ids?: number[];
+  chunk_ids?: number[];
+  documents?: Record<string, string>[];
+  notes?: string | null;
+  truncated?: boolean;
+}
+
+export interface BlueprintComponent {
+  id?: string;
+  blueprint_version_id?: string | null;
+  key: string;
+  name: string;
+  kind: ComponentKind;
+  mapping: ComponentMapping;
+  linked_component_id?: number | null;
+  repo_id: string;
+  commit_sha: string;
+  module_key?: string | null;
+  responsibility?: string | null;
+  interfaces?: ComponentInterface[];
+  confidence?: number | null;
+  evidence?: BlueprintEvidence;
+  generation_status?: GenerationStatus;
+  locked?: boolean;
+  created_at?: string | null;
+}
+
+export interface BlueprintConnection {
+  id?: string;
+  blueprint_version_id?: string | null;
+  key: string;
+  kind: ConnectionKind;
+  source_key: string;
+  target_key: string;
+  semantics?: {
+    protocol?: string | null;
+    trigger?: string | null;
+    description?: string | null;
+  };
+  data_shape?: Record<string, unknown> | null;
+  locked?: boolean;
+  created_at?: string | null;
+}
+
+export interface BlueprintModule {
+  key: string;
+  name?: string | null;
+  components: string[];
+}
+
+export interface ProposedFile {
+  id?: string;
+  blueprint_version_id?: string | null;
+  path: string;
+  status: ProposedFileStatus;
+  purpose: string;
+  implements_component_key?: string | null;
+  conventions_refs?: number[];
+  locked?: boolean;
+  created_at?: string | null;
+}
+
+/** Positions only, keyed by component/connection key. Never semantics. */
+export interface BlueprintLayout {
+  nodes?: { key: string; x: number; y: number; w?: number | null; h?: number | null }[];
+  edges?: { key: string; points?: { x: number; y: number }[] }[];
+  viewport?: { x: number; y: number; zoom: number };
+}
+
+export interface BlueprintUnresolved {
+  decision_id?: string | null;
+  question: string;
+  status?: "open" | "decided" | "deferred";
+  affects?: string[];
+}
+
+/** The assembled document: blueprint.v1.json. */
+export interface BlueprintDocument {
+  schema_version: string;
+  blueprint: Blueprint;
+  version: BlueprintVersion;
+  components: BlueprintComponent[];
+  connections?: BlueprintConnection[];
+  data_flows?: BlueprintConnection[];
+  modules?: BlueprintModule[];
+  proposed_files?: ProposedFile[];
+  layout?: BlueprintLayout;
+  requirement_ids?: string[];
+  constraint_ids?: string[];
+  unresolved?: BlueprintUnresolved[];
+}
+
+export interface BlueprintComponentPatch {
+  name?: string;
+  kind?: ComponentKind;
+  mapping?: ComponentMapping;
+  linked_component_id?: number | null;
+  module_key?: string | null;
+  responsibility?: string | null;
+  generation_status?: GenerationStatus;
+  locked?: boolean;
+}
+
+export interface BlueprintExport {
+  filename: string;
+  markdown: string;
+}
+
+const blueprintPath = (id: string) => `/blueprints/${encodeURIComponent(id)}`;
+
+export function listBlueprints(
+  repoId: string,
+  filter: { commitSha?: string; taskId?: string } = {},
+): Promise<Blueprint[]> {
+  const params: Record<string, string> = {};
+  if (filter.commitSha) params.commit_sha = filter.commitSha;
+  if (filter.taskId) params.task_id = filter.taskId;
+  const q = Object.keys(params).length > 0 ? `?${qs(params)}` : "";
+  return request(`${repoPath(repoId)}/blueprints${q}`);
+}
+
+export function createBlueprint(
+  repoId: string,
+  taskId: string,
+  title: string,
+  commitSha: string,
+): Promise<Blueprint> {
+  return request(
+    `${repoPath(repoId)}/blueprints`,
+    json({ task_id: taskId, title, commit_sha: commitSha }),
+  );
+}
+
+export function getBlueprint(blueprintId: string): Promise<BlueprintDocument> {
+  return request(blueprintPath(blueprintId));
+}
+
+export function listBlueprintVersions(blueprintId: string): Promise<BlueprintVersion[]> {
+  return request(`${blueprintPath(blueprintId)}/versions`);
+}
+
+export function getBlueprintVersion(
+  blueprintId: string,
+  version: number,
+): Promise<BlueprintDocument> {
+  return request(`${blueprintPath(blueprintId)}/versions/${version}`);
+}
+
+export function generateBlueprint(blueprintId: string): Promise<{ job_id: string }> {
+  return request(`${blueprintPath(blueprintId)}/generate`, json({}));
+}
+
+export function validateBlueprint(blueprintId: string): Promise<BlueprintVersion> {
+  return request(`${blueprintPath(blueprintId)}/validate`, json({}));
+}
+
+/** A 422 here means the regeneration would have altered a locked entity. The
+ * server's `detail` shape for that is not pinned down, so callers read it with
+ * `describeRefusal` rather than assuming fields. */
+export function regenerateBlueprint(
+  blueprintId: string,
+  componentKeys?: string[],
+): Promise<{ job_id: string }> {
+  const body: Record<string, unknown> = {};
+  if (componentKeys && componentKeys.length > 0) body.component_keys = componentKeys;
+  return request(`${blueprintPath(blueprintId)}/regenerate`, json(body));
+}
+
+export function patchBlueprintComponent(
+  blueprintId: string,
+  componentId: string,
+  patch: BlueprintComponentPatch,
+): Promise<BlueprintComponent> {
+  return request(
+    `${blueprintPath(blueprintId)}/components/${encodeURIComponent(componentId)}`,
+    json(patch, "PATCH"),
+  );
+}
+
+export function getBlueprintFileStructure(blueprintId: string): Promise<ProposedFile[]> {
+  return request(`${blueprintPath(blueprintId)}/file-structure`);
+}
+
+export function exportBlueprint(blueprintId: string): Promise<BlueprintExport> {
+  return request(`${blueprintPath(blueprintId)}/export`, json({}));
+}
+
+export async function getBlueprintLayout(blueprintId: string): Promise<BlueprintLayout> {
+  const body = await request<{ layout: BlueprintLayout | null }>(
+    `${blueprintPath(blueprintId)}/layout`,
+  );
+  return body.layout ?? {};
+}
+
+/** Persists positions only. This never creates a blueprint version. */
+export function putBlueprintLayout(blueprintId: string, layout: BlueprintLayout): Promise<void> {
+  return requestEmpty(`${blueprintPath(blueprintId)}/layout`, json({ layout }, "PUT"));
+}
+
+/** What a 422 refusal says, flattened for display. The detail may be a
+ * string, a structured object, or FastAPI's validation list; whatever it is,
+ * it is shown rather than swallowed. */
+export interface Refusal {
+  summary: string;
+  reasons: string[];
+}
+
+function reasonText(item: unknown): string {
+  if (typeof item === "string") return item;
+  if (typeof item === "object" && item !== null) {
+    const o = item as Record<string, unknown>;
+    const what = [o.entity_kind, o.entity_key ?? o.key]
+      .filter((x) => typeof x === "string")
+      .join(" ");
+    const why = [o.reason, o.message, o.msg, o.detail].find((x) => typeof x === "string");
+    if (what || why) return [what, why].filter(Boolean).join(": ");
+    return JSON.stringify(item);
+  }
+  return String(item);
+}
+
+export function describeRefusal(detail: unknown, fallback: string): Refusal {
+  if (typeof detail === "string") return { summary: detail, reasons: [] };
+  if (Array.isArray(detail)) return { summary: fallback, reasons: detail.map(reasonText) };
+  if (typeof detail === "object" && detail !== null) {
+    const o = detail as Record<string, unknown>;
+    const summary = [o.detail, o.message, o.reason].find((x) => typeof x === "string");
+    const list = ["reasons", "locked_entities", "locked", "entities", "conflicts", "violations"]
+      .map((k) => o[k])
+      .find((v) => Array.isArray(v));
+    return {
+      summary: (summary as string | undefined) ?? fallback,
+      reasons: Array.isArray(list) ? list.map(reasonText) : [],
+    };
+  }
+  return { summary: fallback, reasons: [] };
 }

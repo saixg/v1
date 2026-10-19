@@ -448,3 +448,124 @@ pre-existing migration-history-drift note above, still unresolved;
 None of these are security-severity like the two above — they're real
 production-readiness gaps, correctly sequenced to Phase 6 rather than
 blocking Phase 5.
+
+## 2026-10-19 update: Phase 5 built — Virtual Development Environment (blueprints)
+
+Part 13 decision #4 resolved first, as build-plan.md requires, then built in
+three passes: the data model (this session), the engine and the frontend (one
+agent each, both verified here rather than taken on trust).
+
+**Part 13 decision #4 — the taxonomy, now locked.** Blueprints get their own
+vocabulary rather than extending the Repo Model's `NodeKind`/`EdgeKind`. The
+reasoning is in the migration's header and matters: those enums name facts an
+analyzer established about code that exists, and a `proposed` component is
+not `parsed`, not `configured`, and not `inferred` either — it is authored.
+Mixing the two would put proposals inside the one vocabulary the rest of the
+product treats as ground truth, which is the line CLAUDE.md draws. So
+blueprint rows carry `generation_status` (`generated|edited|locked`) instead
+of `origin`, and the single seam to the real graph is
+`blueprint_components.linked_component_id -> codeaxis.nodes(id)`, following
+`task_components`' precedent.
+
+Three sub-decisions were flagged and proceeded with on the recommendation:
+a blueprint requires a Context Engine `task_id` (so requirements/constraints
+are referenced, never copied); `locked` is a **hard** block on regeneration,
+not an advisory; and `generation_status` replaces `OriginTag` as above.
+
+**Data model** (`supabase/migrations/20261021000000_blueprint.sql`, applied
+to the live DB). Six tables: `blueprints`, `blueprint_versions`,
+`blueprint_components`, `blueprint_connections`, `proposed_files`,
+`blueprint_layouts`. Two deliberate deviations from Part 6, both documented
+in the migration:
+- **A sixth table Part 6 does not list.** Part 4.G.6 requires layout stored
+  apart from semantics; a `layout jsonb` column on `blueprint_versions` would
+  make dragging a box create a new version of the design, which is wrong.
+- **References by `key`, not row id.** Connections name their endpoints, and
+  a proposed file names its component, by the component's stable `key`,
+  because Part 4.G.9's partial regeneration re-inserts rows. The cost, stated
+  plainly: those two references are enforced by the validator and a
+  per-version unique index, not by a foreign key — Postgres cannot express
+  "matches a sibling row's key within the same version".
+
+The taxonomy's invariants are enforced **twice**, in SQL check constraints and
+again in Pydantic validators: the `kind`/`mapping` pairing
+(existing+reuse, modified+extend, proposed+new), "a non-`proposed` component
+must name the entity it maps to", `locked == (generation_status == 'locked')`,
+no self-loop connections, `data_shape` only on a `data_flow`. **Verified by
+running both** — every contradictory shape is rejected at each layer.
+`packages/schemas/blueprint.v1.json` is the written contract those two agree
+on. A second small migration widens `codeaxis.jobs.kind` for the two
+blueprint job kinds (the one-scan-per-repo partial index is untouched).
+
+**Engine** (`app/blueprint/{validate,generate,files,regenerate,export,document}.py`).
+The validator is the piece Phase 5's exit criterion rests on: 17 stable error
+codes, and it returns errors rather than raising or repairing. It checks the
+things the database cannot — dangling connection endpoints, dependency-only
+cycles (reporting the actual member keys), a `linked_component_id` that must
+resolve to a real `cluster` node **at this blueprint's own snapshot**, an
+`existing` claim with no evidence, a `new` file colliding with a real path,
+and hard-constraint conflicts from the ledger. Generation gives the model
+only repo-grounded candidates and **drops** what it cannot resolve rather
+than downgrading a `reuse` capability into a `proposed` one — the same
+citation-dropping discipline `app/context/extract.py` already uses. Nothing
+is generated from summaries (CLAUDE.md #2).
+
+**Frontend** (`apps/web/src/components/Blueprint*.tsx`, new "Build" tab,
+`@xyflow/react` 12.12.0). Existing vs. proposed vs. modified are
+distinguishable at a glance; the four connection kinds differ visually; a
+linked component clicks through to the Explorer/Inspector; `kind`+`mapping`
+is a single choice offering only the three valid pairings; a locked component
+disables editing and says why; an invalid version shows its reasons attached
+to the entity they name; layout saves are debounced and never version the
+design. No edge animation anywhere — nothing may imply the program ran.
+
+**Routes** (`app/blueprint_api.py`, 14 endpoints, Part 8). App-layer
+authorization on every one. Two things the routes own rather than delegate:
+an edit cannot produce a contradictory component (naming only `kind` derives
+the mapping; a contradictory pair is a 422 rather than a database error the
+UI can't explain), and a mapping cannot point at a node from another
+snapshot. A rejected regeneration is a 422 carrying its reasons, because a
+locked-entity refusal is an answer, not a failure. Also added
+`GET /repos/{id}/tasks`, which closed a real gap — no route listed a repo's
+tasks, so the Build tab had been reduced to remembering ids client-side.
+
+**Verified, not assumed:** `uv run ruff check .` clean, `uv run pyright` 0
+errors, `uv run pytest services/api/tests/blueprint
+services/api/tests/test_blueprint_routes.py -q` → **99 passed** against the
+live DB (81 engine, 18 route). `npm run lint`/`npm run build --prefix
+apps/web` clean — independently re-run here, not taken from the agent's
+report. Two route bugs were caught by running the tests rather than reading
+the code: `list_nodes` has no `limit` kwarg, and `/blueprints/schema-version`
+was shadowed by `/blueprints/{id}` (FastAPI matches in declaration order).
+The engine pass also found and fixed a real pre-existing bug: `belongs_to`
+edges run cluster→member, not member→cluster, which had silently produced
+mapped components with empty evidence.
+
+**De-duplicated before committing:** my first draft of the routes had its own
+document assembly and module grouping. The engine's `build_document`/
+`modules_of` cover strictly more (advisory-vs-blocking errors, open
+decisions), so the route versions were deleted rather than left to drift.
+
+**Known gaps, named not hidden:**
+1. Generation-time `unresolved` has no column on `blueprint_versions`, so it
+   reaches the caller in the response and is then lost; the document rebuilds
+   `unresolved` from advisory errors plus open decisions/questions. A column
+   or an `blueprint_unresolved` table is the fix. Marked `# STUB(CodeAxis):`.
+2. `files.py` never emits `unchanged`, and cited conventions record the
+   model's stated justification without re-verifying it against the path.
+3. No framework detector exists anywhere in the repo, so file proposals
+   substitute manifest-declared dependency nodes and say so.
+4. `persist_version` relies on the knowledge layer's per-call commits, so a
+   mid-fill failure can leave a partial, unpromoted version behind.
+5. Regeneration's affected neighborhood is seeds plus one hop; deeper ripples
+   are not caught and the operator re-seeds.
+6. No live click-through of the Build tab against a running API — lint,
+   typecheck, build and the backend tests are the evidence here.
+
+Phase 5 exit criteria (Part 10): *blueprint references only real entities* —
+enforced by the validator's grounding checks plus the route's snapshot check;
+*invalid blueprints rejected with reasons* — `invalid` is a stored status
+carrying 17 coded reasons, surfaced per entity in the UI; *edits preserve
+approved decisions* — `locked` is a hard block in the regeneration pass and a
+409 at the route. **Pillar 3 is complete in substance**, with the six gaps
+above outstanding.

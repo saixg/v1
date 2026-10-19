@@ -1177,9 +1177,19 @@ def assemble_context_package(
     embedder: QueryEmbedder | None = None,
     allocation: Mapping[str, float] | None = None,
     reground_components: bool = False,
+    extra_sections: Mapping[str, Sequence[Candidate]] | None = None,
+    extra_unresolved: Sequence[dict] = (),
 ) -> AssembledPackage:
     """Assemble, persist and return a new package version for `task_id`.
     Needs `worker_connection`.
+
+    `extra_sections` appends already-built candidates to named sections after
+    the deterministic gather and before budgeting, so a caller with its own
+    stored records to contribute — `app.blueprint.export` hands over a
+    blueprint's per-component implementation context — gets this module's
+    ordering, budgeting and never-truncate-constraints rule rather than a
+    parallel assembler. Items arrive at the end of their section, so they are
+    the first to be cut if that section runs out of budget.
 
     Grounding: the task's stored `task_components` at its active commit are
     used as-is; if there are none (or `reground_components=True`), the
@@ -1202,6 +1212,11 @@ def assemble_context_package(
     inputs = gather_inputs(
         conn, task, token_budget=token_budget, embedder=embedder, literals=literals
     )
+    for kind, candidates in (extra_sections or {}).items():
+        if kind not in SECTION_ORDER:
+            raise ValueError(f"unknown context section {kind!r}; expected one of {SECTION_ORDER}")
+        inputs.sections.setdefault(kind, []).extend(candidates)
+    inputs.unresolved.extend(extra_unresolved)
     plan = plan_package(inputs, token_budget, allocation)
 
     package = create_context_package(

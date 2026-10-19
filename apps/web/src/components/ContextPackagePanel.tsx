@@ -38,7 +38,7 @@ const EXPORTS: { format: ExportFormat; label: string }[] = [
   { format: "context_md", label: "context.md" },
 ];
 
-function download(filename: string, text: string) {
+export function download(filename: string, text: string) {
   const url = URL.createObjectURL(new Blob([text], { type: "text/markdown;charset=utf-8" }));
   const a = document.createElement("a");
   a.href = url;

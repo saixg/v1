@@ -5,19 +5,21 @@ import { useParams, useSearchParams } from "next/navigation";
 import { useState } from "react";
 
 import { AskView } from "@/components/AskView";
+import { BlueprintView } from "@/components/BlueprintView";
 import { CoverageView } from "@/components/CoverageView";
 import { Explorer } from "@/components/Explorer";
 import { Inspector } from "@/components/Inspector";
 import { TaskView } from "@/components/TaskView";
 import { getSymbol, type Citation, type GraphNode } from "@/lib/api";
 
-type Tab = "explore" | "ask" | "coverage" | "context";
+type Tab = "explore" | "ask" | "coverage" | "context" | "build";
 
 const TAB_LABELS: Record<Tab, string> = {
   explore: "Explore",
   ask: "Ask",
   coverage: "Coverage",
   context: "Context",
+  build: "Build",
 };
 
 export function Workspace() {
@@ -29,16 +31,24 @@ export function Workspace() {
   // A citation in an answer selects the node it points at and hands the user
   // back to the Explorer/Inspector pair — one model, reached from a second
   // surface, rather than a second rendering of the same facts.
-  async function openCitation(citation: Citation) {
-    if (!commitSha || citation.node_id === null || citation.node_id === undefined) return;
+  async function openNode(nodeId: number): Promise<boolean> {
+    if (!commitSha) return false;
     try {
-      const detail = await getSymbol(id, citation.node_id, commitSha);
+      const detail = await getSymbol(id, nodeId, commitSha);
       setSelected(detail);
       setTab("explore");
+      return true;
     } catch {
-      // The citation resolved server-side but this fetch failed: stay put
-      // rather than replacing the answer with an error.
+      // The node resolved server-side but this fetch failed: stay put rather
+      // than replacing the answer with an error. Callers that can say so tell
+      // the person it could not be opened.
+      return false;
     }
+  }
+
+  async function openCitation(citation: Citation) {
+    if (citation.node_id === null || citation.node_id === undefined) return;
+    await openNode(citation.node_id);
   }
 
   if (!commitSha) {
@@ -63,7 +73,7 @@ export function Workspace() {
           <span>Pass 1: files and symbol definitions. Nothing was executed.</span>
         </div>
         <div className="flex gap-1" role="tablist" aria-label="Workspace view">
-          {(["explore", "ask", "coverage", "context"] as const).map((t) => (
+          {(["explore", "ask", "coverage", "context", "build"] as const).map((t) => (
             <button
               key={t}
               type="button"
@@ -82,6 +92,15 @@ export function Workspace() {
       {tab === "coverage" ? (
         <section aria-label="Coverage" className="min-h-0 flex-1 overflow-auto">
           <CoverageView repoId={id} commitSha={commitSha} />
+        </section>
+      ) : tab === "build" ? (
+        <section aria-label="Build" className="min-h-0 flex-1 overflow-auto">
+          <BlueprintView
+            repoId={id}
+            commitSha={commitSha}
+            onOpenCitation={openCitation}
+            onOpenNode={openNode}
+          />
         </section>
       ) : tab === "context" ? (
         <section aria-label="Agent context" className="min-h-0 flex-1 overflow-auto">

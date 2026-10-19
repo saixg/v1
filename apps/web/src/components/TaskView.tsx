@@ -28,7 +28,7 @@ import { TaskIntake } from "./TaskIntake";
 
 const storeKey = (repoId: string) => `codeaxis:tasks:${repoId}`;
 
-function readIds(repoId: string): string[] {
+export function readIds(repoId: string): string[] {
   try {
     const raw = localStorage.getItem(storeKey(repoId));
     const parsed: unknown = raw ? JSON.parse(raw) : [];

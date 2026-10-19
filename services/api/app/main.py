@@ -57,6 +57,7 @@ from app.auth import (
     require_project_member,
     require_uuid,
 )
+from app.blueprint_api import router as blueprint_router
 from app.context_api import router as context_router
 from app.knowledge import (
     JobAlreadyExistsError,
@@ -110,6 +111,10 @@ app.add_middleware(RequestLoggingMiddleware)
 # endpoint. Each module authorizes in app code; see their docstrings.
 app.include_router(context_router)
 app.include_router(mcp_router)
+
+# Virtual Development Environment (blueprints). Same app-layer authorization
+# contract; see app/blueprint_api.py's docstring.
+app.include_router(blueprint_router)
 
 app.add_middleware(
     CORSMiddleware,
