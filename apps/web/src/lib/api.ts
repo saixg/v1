@@ -2,20 +2,63 @@
 // app/models/schemas.py and the response models in app/main.py — nothing
 // here is invented on the client side.
 
-// The localhost default is for local development only. In a production build
-// it is a deployment mistake, not a fallback: the browser would quietly fail
-// every request against an origin that isn't there. Next.js inlines
-// NEXT_PUBLIC_* at build time, so this throws during `next build` — a failed
-// deploy with a clear reason beats a deployed app that cannot reach its API.
-const configuredApiUrl = process.env.NEXT_PUBLIC_API_URL;
-if (!configuredApiUrl && process.env.NODE_ENV === "production") {
-  throw new Error(
-    "NEXT_PUBLIC_API_URL must be set for a production build; it is inlined at " +
-      "build time, so setting it only at runtime has no effect.",
-  );
+// Where the API lives, resolved at *runtime* rather than inlined at build
+// time. `NEXT_PUBLIC_*` is baked into the bundle by Next.js, which would mean
+// a full rebuild every time the backend moves — and during development the
+// backend moves often. So the build-time value is only a hint, and the
+// authoritative answer comes from /api/config, which reads a server-side env
+// var the deployment can change without rebuilding.
+const buildTimeApiUrl = process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "");
+
+// Resolved once per page load and reused. The promise itself is cached, not
+// just its result, so concurrent first calls share one request instead of
+// racing to fetch the same config.
+let apiUrlPromise: Promise<string> | null = null;
+
+async function fetchConfiguredApiUrl(): Promise<string> {
+  try {
+    const resp = await fetch("/api/config", { cache: "no-store" });
+    if (resp.ok) {
+      const body = (await resp.json()) as { apiUrl?: unknown };
+      if (typeof body.apiUrl === "string" && body.apiUrl) {
+        return body.apiUrl.replace(/\/$/, "");
+      }
+    }
+  } catch {
+    // Falls through to the build-time hint below. A config endpoint that is
+    // unreachable is not worth failing over when a usable value may already
+    // be compiled in — but it must not silently win over a real answer,
+    // which is why this only runs when /api/config gave us nothing.
+  }
+  return buildTimeApiUrl ?? "http://localhost:8000";
 }
 
-export const API_URL = (configuredApiUrl ?? "http://localhost:8000").replace(/\/$/, "");
+export function resolveApiUrl(): Promise<string> {
+  // An explicit build-time value wins and costs no request. That is the right
+  // default for local development and for any deploy that knows its backend
+  // at build time.
+  //
+  // A deployment that wants to move its backend without rebuilding simply
+  // leaves NEXT_PUBLIC_API_URL unset and sets CODEAXIS_API_URL instead, which
+  // /api/config serves at runtime. Making the absent case the one that asks
+  // the server keeps the common path synchronous and keeps every existing
+  // caller's behaviour unchanged.
+  if (buildTimeApiUrl) return Promise.resolve(buildTimeApiUrl);
+
+  // Server-side (route handlers, RSC) there is no origin to resolve a
+  // relative URL against, so there is nothing to ask.
+  if (typeof window === "undefined") {
+    return Promise.resolve((process.env.CODEAXIS_API_URL ?? "http://localhost:8000").replace(/\/$/, ""));
+  }
+
+  apiUrlPromise ??= fetchConfiguredApiUrl();
+  return apiUrlPromise;
+}
+
+// Exported for tests, which need to clear the memoized value between cases.
+export function resetApiUrlForTests(): void {
+  apiUrlPromise = null;
+}
 
 // This module has no React hook of its own, so `ClerkTokenBridge` (mounted
 // once in layout.tsx) feeds it Clerk's `useAuth().getToken` here.
@@ -210,14 +253,18 @@ export class ApiError extends Error {
  * how to read a success body (JSON, text, or nothing for a 204). */
 async function send(path: string, init?: RequestInit): Promise<Response> {
   let resp: Response;
+  // Resolved before the request rather than at module load, so the base URL
+  // can come from the deployment's runtime config. Captured in a local so the
+  // error path below names the same URL the request actually used.
+  const base = await resolveApiUrl();
   try {
     const auth = await authHeader();
-    resp = await fetch(`${API_URL}${path}`, {
+    resp = await fetch(`${base}${path}`, {
       ...init,
       headers: { ...auth, ...(init?.headers ?? {}) },
     });
   } catch {
-    throw new ApiError(0, `Could not reach the CodeAxis API at ${API_URL}. Check that it is running.`);
+    throw new ApiError(0, `Could not reach the CodeAxis API at ${base}. Check that it is running.`);
   }
   if (!resp.ok) {
     let detail = `${resp.status} ${resp.statusText}`;

@@ -786,3 +786,93 @@ throwaway loopback Postgres credentials and truncated `pk_live_...` /
 `sk-ant-...` placeholders in the deployment guide). Flagged because real keys
 are about to go into Fly and Vercel, and a public repository makes the
 deployment surface easier to study.
+
+## 2026-10-20 update: web app deployed; runtime API config; local dev made real
+
+First deployment of anything. `apps/web` is live on Vercel at
+**https://codeaxis-web.vercel.app** (project `codeaxis-web`, root directory
+`apps/web`, git-connected to `saixg/v1` so every push to `main` deploys).
+Verified by request, not by the CLI's success message: `/` and `/sign-in`
+both return 200 and the served HTML contains Clerk's real client
+(`ClerkProvider`, `clerk-js`, plus this app's own `ClerkTokenBridge`), which
+also proves `CLERK_SECRET_KEY` took effect — `auth.protect()` runs
+server-side and the unauthenticated redirect works.
+
+**The API is not deployed.** Fly refuses to create an app without payment
+information, which the owner has not added yet. So every data view on the
+deployed site fails at the network layer and shows the client's honest
+"Could not reach the API" state. The CLI is installed and authenticated and
+`fly.toml` is correct; `fly apps create` is the only remaining step.
+
+**Runtime-configurable API base URL.** `apps/web/src/lib/api.ts` previously
+read `NEXT_PUBLIC_API_URL`, which Next.js inlines at build time — so moving
+the backend meant a rebuild. Now `resolveApiUrl()` resolves it per page load
+with a fixed precedence: an explicit `NEXT_PUBLIC_API_URL` wins (right for
+local dev, and costs no request), otherwise the new
+`apps/web/src/app/api/config/route.ts` serves `CODEAXIS_API_URL` from the
+server at runtime, otherwise `http://localhost:8000`. The blast radius was
+the two lines inside `send()` that the earlier exploration predicted, because
+nothing imports the base URL directly and `send()` was already async. The
+promise is cached rather than the value, so concurrent first calls share one
+request instead of racing.
+
+Consequences worth knowing: the production build no longer throws without
+`NEXT_PUBLIC_API_URL` (that guard existed only because the value was
+build-time), so CI's placeholder for it was removed — CI now builds the
+configuration a real deploy actually uses. On Vercel,
+`NEXT_PUBLIC_API_URL` was **deleted** and `CODEAXIS_API_URL` set in its
+place; setting both and then changing only the latter is the one way to get a
+confusing no-op, which `apps/web/.env.local.example` and
+`docs/deployment.md` now both say.
+
+**The config route is deliberately unauthenticated.** `src/proxy.ts` runs
+`clerkMiddleware()` over it, but that only exposes auth state and does not
+gate, so the route is readable before sign-in — which it must be, since the
+URL is needed for the first request. Nothing secret is in that payload: the
+API's base URL appears in every network request the browser makes anyway.
+
+**Local dev works and is documented for the first time.** `npm run dev` now
+starts the API and the web app together (`concurrently`, new dev
+dependency); previously two processes had to be found and started by hand,
+with no written procedure anywhere — `README.md` was the single line `# v1`.
+It is now a real README: layout, the minimum environment variables and which
+component dies without each, first-time database setup, test commands, and
+the two rules (the one governing principle, and that imported repositories
+are untrusted) that someone changing this code needs before they start.
+`apps/web/.env.local` existed but held only a `VERCEL_OIDC_TOKEN` from
+`vercel link`, so no page could render; it now carries the Clerk keys.
+Verified by running: both processes came up, `/health` returned
+`{"status":"ok"}`, and `/api/config` returned the expected URL.
+
+**Two documentation defects fixed.** `docs/deployment.md` still told the
+operator that CORS was hardcoded to localhost and "must be changed before the
+web app can talk to the deployed API" — untrue since it became env-driven,
+and actively misleading. And `app/auth.py` reads `CLERK_ALLOWED_ORIGINS` with
+an empty-set default while `app/main.py` defaults the same variable to
+`http://localhost:3000`. That reads like a bug and is not: unset means "skip
+the `azp` check" in one and "allow local development" in the other, and both
+are the right behaviour for an unset value. It is now commented as deliberate
+so nobody "fixes" one and silently breaks the other.
+
+**Verified:** `uv run ruff check .` clean, `uv run pyright` 0 errors,
+`npm run test:web` → **50 passed** (up from 43; 7 new tests pin the API-URL
+precedence, including that a recursive config fetch cannot race and that an
+unconfigured deployment's empty answer is not mistaken for an address),
+`npm run lint:web` clean, and `npm run build:web` clean **without**
+`NEXT_PUBLIC_API_URL` — the configuration a real deploy uses. The backend
+suite was started and had not finished when this entry was written; the next
+session should re-run `uv run pytest -q` and expect 898 before trusting a
+count.
+
+**Open, and the reason the platform is not live:**
+1. **Fly needs a card.** `https://fly.io/dashboard/sai-gireesh/billing`.
+   Roughly $5–15/month for one always-on machine. Nothing else blocks the
+   API deploy.
+2. **No `ANTHROPIC_API_KEY`.** A Gemini key was supplied instead and a Gemini
+   provider is being added (see the following entry if it exists).
+3. **Two secrets were pasted into a chat transcript** — the Clerk
+   `sk_test_…` and the Gemini key — and both need rotating in their
+   dashboards, after which the Vercel variable and the root `.env` need the
+   new values.
+4. **Clerk is a `pk_test` development instance**: user-capped and dev-mode
+   badged. A public launch needs a production instance on a custom domain.

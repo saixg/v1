@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   ApiError,
-  API_URL,
+  resolveApiUrl,
   exportContext,
   getCoverage,
   isCitationCheckFailure,
@@ -79,7 +79,8 @@ describe("send() error shaping", () => {
     fetchMock.mockRejectedValue(new TypeError("fetch failed"));
     const err = await failure();
     expect(err.status).toBe(0);
-    expect(err.message).toContain(API_URL);
+    // Names the base URL the request actually used, not a build-time constant.
+    expect(err.message).toContain(await resolveApiUrl());
   });
 
   it("sends the bearer token when a getter is registered, and none otherwise", async () => {

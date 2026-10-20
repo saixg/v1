@@ -5,6 +5,8 @@
     "apps/*"
   ],
   "scripts": {
+    "dev": "concurrently --names api,web --prefix-colors cyan,magenta --kill-others-on-fail \"npm run dev:api\" \"npm run dev:web\"",
+    "dev:api": "uv run --directory services/api uvicorn app.main:app --reload --port 8000",
     "dev:web": "npm run dev -w @codeaxis/web",
     "build:web": "npm run build -w @codeaxis/web",
     "lint:web": "npm run lint -w @codeaxis/web",
@@ -15,6 +17,7 @@
     "node": ">=20"
   },
   "devDependencies": {
+    "concurrently": "^10.0.6",
     "supabase": "^2.120.0"
   }
 }

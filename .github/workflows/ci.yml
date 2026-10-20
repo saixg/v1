@@ -81,12 +81,10 @@ jobs:
         run: npm ci
 
       - name: Build web
-        # NEXT_PUBLIC_* is inlined at build time, and src/lib/api.ts refuses to
-        # build a production bundle without this — a forgotten value would
-        # otherwise ship an app that cannot reach its API. The value here is a
-        # placeholder: CI only proves the bundle compiles, never calls it.
-        env:
-          NEXT_PUBLIC_API_URL: https://api.invalid
+        # No NEXT_PUBLIC_API_URL on purpose. The base URL is resolved at
+        # runtime from /api/config (src/lib/api.ts), so building without it is
+        # the configuration a real deploy uses — and this step proves that
+        # path compiles rather than only the baked-in one.
         run: npm run build:web
 
       - name: Lint web

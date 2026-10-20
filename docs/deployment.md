@@ -22,14 +22,17 @@ this document.
 
 1. **`supabase db push` does not work against the existing database.** There is
    recorded migration-history drift. See §2.
-2. **CORS in the API is hardcoded to `http://localhost:3000`**
-   (`services/api/app/main.py`, `allow_origins=["http://localhost:3000"]`).
-   A browser on a Vercel domain will be blocked by the API on every request.
-   **This must be changed before the web app can talk to the deployed API.**
-   It is a one-line change in `main.py` to read an allowlist from the
-   environment; it is called out here rather than done here because that file
-   is owned elsewhere. Until then, the deployed web app is non-functional
-   against the deployed API.
+2. **CORS is env-driven — and you must set it.** `services/api/app/main.py`
+   builds its allowlist from `CLERK_ALLOWED_ORIGINS` (comma-separated),
+   falling back to `http://localhost:3000` when unset. So a deployed API with
+   this unset will block your Vercel frontend on every request. Set it to the
+   web app's real origin, e.g.
+   `CLERK_ALLOWED_ORIGINS=https://codeaxis-web.vercel.app`. A `*` entry is
+   **refused at startup**: this API is always called with an `Authorization`
+   header, and the CORS spec forbids a wildcard alongside credentials.
+   The same variable is read a second time, independently, by
+   `app/auth.py`'s `get_verifier()` to check a token's `azp` claim — one
+   value, two gates, so a wrong value fails in two places at once.
 3. **Scan jobs run in-process** via FastAPI `BackgroundTasks`
    (`app/analysis/jobs.py`, marked `STUB(CodeAxis)`). There is no queue, no
    retry and no stale-job reaper. Any restart of the API machine during a scan
@@ -97,7 +100,8 @@ inferred from `.env.example`.
 
 | Variable | Why |
 | --- | --- |
-| `NEXT_PUBLIC_API_URL` | `apps/web/src/lib/api.ts` resolves the API base URL from it and **falls back to `http://localhost:8000`**. So the app is deploy-ready in that it already reads an env var — but if you forget to set it, every request from the Vercel deployment goes to the visitor's own localhost and silently fails. Set it to `https://codeaxis-api.fly.dev` (or your custom domain), no trailing slash needed — the module strips one. |
+| `CODEAXIS_API_URL` | **Use this one on Vercel.** `apps/web/src/app/api/config/route.ts` serves it at runtime and `src/lib/api.ts` resolves the base URL from there, so re-pointing the backend needs no rebuild. Set it to `https://codeaxis-api.fly.dev` (or your custom domain); a trailing slash is stripped for you. |
+| `NEXT_PUBLIC_API_URL` | The build-time alternative, inlined into the bundle. It **takes precedence** when set, so leave it unset on a deployment that wants the runtime variable above — setting both and then changing only `CODEAXIS_API_URL` is the one way to get a confusing no-op. With neither set, the client falls back to `http://localhost:8000`, which from a visitor's browser means their own machine and a silent failure. |
 | `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` | `@clerk/nextjs`, client side. |
 | `CLERK_SECRET_KEY` | `@clerk/nextjs`, server side — every page calls `auth.protect()`. Not referenced in our source; the SDK reads it from the environment itself. Mark it as a Vercel secret, not a plain variable. |
 
@@ -411,11 +415,13 @@ curl -s -o /dev/null -w "%{http_code}\n" https://your-app.vercel.app/   # expect
 ```
 
 Then open it in a browser, sign in, and watch the Network tab: requests must go
-to your Fly hostname, not `localhost:8000`. If they go to localhost,
-`NEXT_PUBLIC_API_URL` was not set at **build** time — set it and redeploy.
+to your Fly hostname, not `localhost:8000`. If they go to localhost, check
+`/api/config` on the deployed site — it returns the URL the client will use.
+`{"configured": false}` means `CODEAXIS_API_URL` is unset; a stale value there
+means `NEXT_PUBLIC_API_URL` is also set and winning.
 
-If they go to the right host but every one fails with a CORS error, that is
-§0.2, not a misconfiguration on your part.
+If they go to the right host but every one fails with a CORS error, set
+`CLERK_ALLOWED_ORIGINS` on the API to the web app's origin (§0.2).
 
 ### Roll back
 

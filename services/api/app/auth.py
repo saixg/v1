@@ -142,6 +142,14 @@ def get_verifier() -> JwtVerifier:
     publishable_key = os.environ.get("CLERK_PUBLISHABLE_KEY", "").strip()
     if not publishable_key:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "authentication is not configured")
+    # Note the asymmetry with `app/main.py`, which reads the same variable but
+    # falls back to `http://localhost:3000`. Both defaults are deliberate and
+    # mean different things: there, an empty CORS allowlist would block local
+    # development, so it needs a usable default; here, an empty set means "do
+    # not check `azp` at all", which is the right behaviour for an unset
+    # value because inventing an expected origin would reject every real
+    # token. Set the variable and both gates agree; leave it unset and you
+    # get permissive dev behaviour in both.
     allowed_origins = frozenset(
         o.strip() for o in os.environ.get("CLERK_ALLOWED_ORIGINS", "").split(",") if o.strip()
     )
