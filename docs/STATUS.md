@@ -860,9 +860,9 @@ precedence, including that a recursive config fetch cannot race and that an
 unconfigured deployment's empty answer is not mistaken for an address),
 `npm run lint:web` clean, and `npm run build:web` clean **without**
 `NEXT_PUBLIC_API_URL` — the configuration a real deploy uses. The backend
-suite was started and had not finished when this entry was written; the next
-session should re-run `uv run pytest -q` and expect 898 before trusting a
-count.
+suite finished after this entry was first written: **898 passed, 2 skipped,
+0 failed** (the skips are Docker-absent and the Windows symlink privilege),
+so none of the above regressed anything.
 
 **Open, and the reason the platform is not live:**
 1. **Fly needs a card.** `https://fly.io/dashboard/sai-gireesh/billing`.
