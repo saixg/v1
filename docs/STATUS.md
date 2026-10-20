@@ -601,10 +601,10 @@ Two honesty corrections came out of that work. The sandbox README had claimed
 **"no outbound network," which was false** — Postgres, Clerk, Anthropic and
 GitHub are all required; the claim is retracted. And on Fly **none of the
 `docker run` hardening flags apply**; only image-level properties survive,
-which the README now says instead of implying otherwise. The image is
-**unbuilt** — Docker is not installed in this environment, so the Dockerfile
-is reasoned-only and carries no measured size. Said plainly rather than
-papered over.
+which the README now says instead of implying otherwise. The image was
+written **unbuilt** — Docker is not installed in this environment — and that
+gap is now closed by CI rather than by assertion: see the 2026-10-20
+follow-up at the end of this file.
 
 **Limits** (`app/limits/{budget,ratelimit}.py`, `app/knowledge/spend.py`,
 migration `20261022000000_cost_caps.sql`, applied additively to the live DB).
@@ -656,7 +656,8 @@ fakes that minimum and `scripts/apply_migrations.py` replays migrations in
 filename order. Verified locally against a real Postgres 16 + pgvector in a
 clean checkout: **897 passed, 2 skipped** — against **402 passed, 227
 skipped** without a database, which is the measure of how much had been
-invisible. **Unverified: the workflow has never run on GitHub.**
+invisible. (Written as "unverified, never run on GitHub"; it has since run —
+see the follow-up at the end of this file.)
 
 Frontend tests exist for the first time: Vitest 4.1.12 + React Testing
 Library, **43 tests** over the places where logic rather than layout lives —
@@ -725,3 +726,63 @@ biggest gap: every scan shares one process. Rate limits are per-machine. The
 Inspector's "Control-flow summaries" stub stays: nothing in the graph,
 analyzers or migrations produces control-flow data, and filling it would be
 fabricating a view.
+
+## 2026-10-20 follow-up: three of Phase 6's four unverified claims are now verified
+
+Phase 6 shipped with four things named as unverified. Three are closed, by
+machines rather than by reasoning, and the fourth is unchanged and belongs to
+a human.
+
+**The workflow has now run on GitHub, and passed on the first attempt** —
+run #7 on `a7dcab5`, all three jobs green. That was not the expectation; a
+workflow that has never executed usually needs a few cycles. One break *was*
+caught locally just before pushing, which is probably why: the node job ran
+`build:web` with no `NEXT_PUBLIC_API_URL`, and the fix landed an hour earlier
+makes a production build throw without it — so the very run meant to prove CI
+works would have failed on it. Fixed in the same commit that added the docker
+job.
+
+**The DB-integration suite genuinely executed in CI**, and the evidence is
+structural rather than circumstantial: the workflow sets
+`CODEAXIS_REQUIRE_DB=1`, and `tests/conftest.py`'s `pytest_sessionfinish` hook
+flips a passing run to failed if any test skipped for want of a database. A
+green Python job therefore *cannot* mean "the DB tests were skipped again".
+Worth recording because the step took 32 seconds against ~26 minutes locally,
+which looks alarming until you notice the local figure is dominated by
+per-query network round-trips to a Supabase instance in another region, while
+CI talks to Postgres over loopback.
+
+**The image builds.** A new `docker` job builds `services/api/Dockerfile` on
+every push and then asserts the two properties the image is supposed to
+guarantee, which `infra/sandbox/tests/` could previously only claim by
+parsing the Dockerfile as text: it does not run as root, and the `git` binary
+the ingest and history analyzers shell out to is actually present. This is how
+the gap gets closed permanently, rather than by installing Docker on one
+developer's machine — the build now re-verifies itself on every commit.
+
+**Rate limits: made honest rather than made global.** `fly.toml` now caps
+`max_machines_running = 1`. The limiter keeps counters in process memory, so
+each additional machine multiplies every published limit; one machine is the
+only configuration in which the advertised limits are the real ones. This is
+a correctness constraint, not a cost preference, and the comment in `fly.toml`
+says so — along with the warning that `fly scale count` overrides the file and
+would silently reintroduce the multiplication. A shared counter store
+(Postgres table or Redis) is the prerequisite for ever raising it. The cost
+cap is unaffected: it reads the shared `codeaxis.llm_calls` ledger and stays
+global at any machine count.
+
+**Still unverified, and not something this session can close: no live
+click-through of the UI.** It needs a real Clerk sign-in, which requires a
+human with an account — the same reason it has been outstanding since Phase 0.
+Everything around it is now verified by machine (typecheck, lint, 43 frontend
+tests, production build, 898 backend tests, CI), but "a person signed in and
+the product worked" is not among those things, and no amount of green CI
+should be read as if it were.
+
+**Noted while pushing:** the GitHub repository is **public** — an
+unauthenticated API read of it returns 200. No secrets are committed (the
+outgoing diffs were scanned before both pushes; the only matches were CI's
+throwaway loopback Postgres credentials and truncated `pk_live_...` /
+`sk-ant-...` placeholders in the deployment guide). Flagged because real keys
+are about to go into Fly and Vercel, and a public repository makes the
+deployment surface easier to study.
