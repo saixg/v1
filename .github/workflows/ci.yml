@@ -81,6 +81,12 @@ jobs:
         run: npm ci
 
       - name: Build web
+        # NEXT_PUBLIC_* is inlined at build time, and src/lib/api.ts refuses to
+        # build a production bundle without this — a forgotten value would
+        # otherwise ship an app that cannot reach its API. The value here is a
+        # placeholder: CI only proves the bundle compiles, never calls it.
+        env:
+          NEXT_PUBLIC_API_URL: https://api.invalid
         run: npm run build:web
 
       - name: Lint web
@@ -88,3 +94,43 @@ jobs:
 
       - name: Test web
         run: npm run test:web
+
+  docker:
+    name: Docker (API image builds)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Builds only. Nothing is pushed to a registry and nothing is run: this
+      # job answers one question — does the image a deploy would build still
+      # build at all — which no local machine here can answer, since Docker
+      # is not installed on the development box.
+      #
+      # The build context is the workspace root (not services/api) because
+      # uv.lock lives there and the Dockerfile's `uv sync --frozen` needs it.
+      - name: Build the API image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: services/api/Dockerfile
+          push: false
+          load: true
+          tags: codeaxis-api:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Asserts the two properties the image is supposed to guarantee and that
+      # the Dockerfile-parsing tests under infra/sandbox/tests/ can only claim:
+      # it does not run as root, and the git binary the ingest/history
+      # analyzers shell out to is actually present.
+      - name: Check the image's own contract
+        run: |
+          set -euo pipefail
+          uid="$(docker run --rm --entrypoint id codeaxis-api:ci -u)"
+          test "$uid" != "0"
+          echo "runs as uid $uid"
+          docker run --rm --entrypoint git codeaxis-api:ci --version
+          echo "image size: $(docker image inspect codeaxis-api:ci --format '{{.Size}}' | numfmt --to=iec)"

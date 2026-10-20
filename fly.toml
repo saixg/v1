@@ -49,6 +49,19 @@ primary_region = "bom"
   auto_start_machines = true
   min_machines_running = 1
 
+  # Deliberately capped at one machine, and this is a correctness constraint
+  # rather than a budget one: the rate limiter keeps its counters in process
+  # memory (app/limits/ratelimit.py's STUB note), so every machine added
+  # multiplies every published limit by the machine count. One machine is the
+  # only configuration in which the advertised limits are the real ones.
+  #
+  # Before raising this, the limiter needs a shared store (a Postgres counters
+  # table or Redis). The cost cap does NOT have this problem — it reads the
+  # shared codeaxis.llm_calls ledger, so it stays global however many machines
+  # run. Note `fly scale count` overrides this file, so raising it there
+  # silently reintroduces the multiplication.
+  max_machines_running = 1
+
   # One worker process (see the Dockerfile's ENTRYPOINT), and a scan occupies
   # it for minutes. Low limits so Fly load-balances to another machine instead
   # of queueing behind a scan; `hard_limit` bounds how many concurrent scans a
