@@ -2,7 +2,20 @@
 // app/models/schemas.py and the response models in app/main.py — nothing
 // here is invented on the client side.
 
-export const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000").replace(/\/$/, "");
+// The localhost default is for local development only. In a production build
+// it is a deployment mistake, not a fallback: the browser would quietly fail
+// every request against an origin that isn't there. Next.js inlines
+// NEXT_PUBLIC_* at build time, so this throws during `next build` — a failed
+// deploy with a clear reason beats a deployed app that cannot reach its API.
+const configuredApiUrl = process.env.NEXT_PUBLIC_API_URL;
+if (!configuredApiUrl && process.env.NODE_ENV === "production") {
+  throw new Error(
+    "NEXT_PUBLIC_API_URL must be set for a production build; it is inlined at " +
+      "build time, so setting it only at runtime has no effect.",
+  );
+}
+
+export const API_URL = (configuredApiUrl ?? "http://localhost:8000").replace(/\/$/, "");
 
 // This module has no React hook of its own, so `ClerkTokenBridge` (mounted
 // once in layout.tsx) feeds it Clerk's `useAuth().getToken` here.
@@ -1114,6 +1127,12 @@ export function listApiTokens(
   includeRevoked = false,
 ): Promise<{ tokens: ApiTokenRecord[] }> {
   return request(`${repoPath(repoId)}/api-tokens?${qs({ include_revoked: String(includeRevoked) })}`);
+}
+
+/** Permanently deletes the repo and everything derived from it. 409 while a
+ * scan is queued or running; the server's detail says so verbatim. */
+export function deleteRepo(repoId: string): Promise<void> {
+  return requestEmpty(repoPath(repoId), { method: "DELETE" });
 }
 
 export function revokeApiToken(repoId: string, tokenId: string): Promise<void> {

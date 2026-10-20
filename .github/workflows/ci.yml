@@ -10,6 +10,33 @@ jobs:
   python:
     name: Python (ruff, pyright, pytest)
     runs-on: ubuntu-latest
+    # Without this, every test gated on WORKER_DATABASE_URL skips silently
+    # (a few hundred of them). pgvector/pgvector is plain Postgres plus the
+    # extension that supabase/migrations/20261014000000_repo_model.sql needs.
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # DATABASE_URL is the superuser/owner connection some tests need for
+      # setup and teardown; the other two are the least-privilege roles the
+      # application itself runs as (created by the shim, granted by
+      # scripts/setup_db_roles.py).
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+      WORKER_DATABASE_URL: postgresql://codeaxis_worker:ci-worker@127.0.0.1:5432/postgres
+      API_DATABASE_URL: postgresql://codeaxis_api:ci-api@127.0.0.1:5432/postgres
+      # Makes a DB-gated test that skips a failure of the run (see
+      # services/api/tests/conftest.py), so this job cannot go green again
+      # while quietly executing none of the integration suite.
+      CODEAXIS_REQUIRE_DB: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -30,11 +57,17 @@ jobs:
       - name: Type check (pyright)
         run: uv run pyright
 
+      - name: Apply migrations (Supabase shim, then supabase/migrations in order)
+        run: uv run python scripts/apply_migrations.py --shim
+
+      - name: Create and grant database roles
+        run: uv run python scripts/setup_db_roles.py
+
       - name: Test (pytest)
-        run: uv run pytest -q
+        run: uv run pytest -q -rs
 
   node:
-    name: Node (build, lint)
+    name: Node (build, lint, test)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -52,3 +85,6 @@ jobs:
 
       - name: Lint web
         run: npm run lint:web
+
+      - name: Test web
+        run: npm run test:web

@@ -25,7 +25,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal, TypeVar
+from typing import Any, Literal, Protocol, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
@@ -42,6 +42,24 @@ from app.models import LlmCall, LlmCallStatus, LlmOperation, ModelRole
 T = TypeVar("T", bound=BaseModel)
 
 UsageRecorder = Callable[[LlmCall], None]
+
+
+class BudgetGuard(Protocol):
+    """The pre-call cost cap, as this module needs it.
+
+    Structural, and declared here rather than imported, so `app.llm` keeps no
+    dependency on `app.limits` (which pulls in FastAPI through `app.auth`).
+    `app.limits.budget.ProjectBudgetGuard` is the implementation; the
+    production factories in `app/llm/__init__.py` install it lazily.
+
+    `check` raises to refuse the call. The exception it raises is deliberately
+    *not* a `ModelServiceError`: a cap refusal is not a provider failure, so it
+    must not be caught by handlers that turn provider failures into 502s.
+    """
+
+    def check(self, project_id: str | None, *, operation: str) -> None: ...
+
+    def note_spend(self, project_id: str | None, cost_usd: float | None) -> None: ...
 
 
 # --- request / response shapes ------------------------------------------------
@@ -265,6 +283,7 @@ class RoutedModelService(ModelService):
         routes: dict[ModelRole, ModelRoute] | None = None,
         clock: Callable[[], float] = time.perf_counter,
         embedding_provider: EmbeddingProvider | None = None,
+        budget: BudgetGuard | None = None,
     ) -> None:
         self._provider = provider
         self._recorder = recorder
@@ -275,6 +294,13 @@ class RoutedModelService(ModelService):
         # "embeddings are a pluggable stage"). `embed` then raises
         # EmbeddingNotConfiguredError instead of inventing a provider.
         self._embedding_provider = embedding_provider
+        # None means "no cap enforced", which is correct for a unit test with
+        # a fake provider and for the eval harness; the production factories
+        # always install one. The check is per provider attempt -- the only
+        # place every path (first attempt, schema retry, embedding batch)
+        # funnels through -- so no caller can bypass it by calling a
+        # different method.
+        self._budget = budget
 
     # -- public API --
 
@@ -401,6 +427,8 @@ class RoutedModelService(ModelService):
     ) -> list[list[float]]:
         """One provider request: timed, recorded, shape-checked."""
         assert self._embedding_provider is not None
+        if self._budget is not None:
+            self._budget.check(context.project_id if context else None, operation="embed")
         started = self._clock()
         try:
             response = self._embedding_provider.embed(request)
@@ -438,7 +466,7 @@ class RoutedModelService(ModelService):
         assert self._embedding_provider is not None
         input_tokens = response.input_tokens if response else 0
         served_model = response.served_model if response else None
-        self._recorder(
+        self._emit(
             LlmCall(
                 role=role,
                 provider=self._embedding_provider.name,
@@ -494,6 +522,10 @@ class RoutedModelService(ModelService):
     ) -> tuple[Completion, int]:
         """One provider attempt. Records and raises on transport error, refusal,
         or truncation; otherwise returns the completion for the caller to judge."""
+        if self._budget is not None:
+            # Before the request is sent and before anything is recorded: a
+            # refused call was never made, so it writes no llm_calls row.
+            self._budget.check(context.project_id if context else None, operation=operation)
         started = self._clock()
         try:
             completion = self._provider.complete(request)
@@ -542,7 +574,7 @@ class RoutedModelService(ModelService):
     ) -> None:
         c = completion or Completion(text="", stop_reason=None)
         priced_model = c.served_model or request.model
-        self._recorder(
+        self._emit(
             LlmCall(
                 role=role,
                 provider=self._provider.name,
@@ -572,6 +604,16 @@ class RoutedModelService(ModelService):
                 job_id=context.job_id if context else None,
             )
         )
+
+    def _emit(self, call: LlmCall) -> None:
+        """Record one usage row, then charge it against the budget's cached
+        total. Recording comes first and still fails the call if it fails (an
+        unrecorded model call is a bug); the budget is told afterwards so a
+        long pass sees its own spend accumulate between ledger reads rather
+        than re-checking a stale total per call."""
+        self._recorder(call)
+        if self._budget is not None:
+            self._budget.note_spend(call.project_id, call.cost_usd)
 
 
 # --- embedding batching -------------------------------------------------------

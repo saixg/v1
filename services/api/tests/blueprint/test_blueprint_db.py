@@ -346,9 +346,11 @@ def test_file_statuses_are_checked_against_real_paths(scanned: ScannedRepo, made
         )
         outcome = validate_and_record(conn, version.id)
 
-    assert sorted(e.code for e in outcome.errors) == sorted(
-        [NEW_FILE_PATH_COLLISION, CHANGED_FILE_PATH_MISSING]
-    )
+    # Subset, not equality: this version has files but no components, which is
+    # separately invalid (EMPTY_BLUEPRINT). What is under test here is that
+    # both file statuses were checked against real paths in the snapshot.
+    found = {e.code for e in outcome.errors}
+    assert {NEW_FILE_PATH_COLLISION, CHANGED_FILE_PATH_MISSING} <= found
 
 
 # --- partial regeneration -----------------------------------------------------

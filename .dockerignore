@@ -1,0 +1,43 @@
+# Build context for services/api/Dockerfile. The context is the workspace root
+# because uv.lock lives here; this file is what stops that from meaning
+# "upload node_modules and the whole git history to the builder".
+#
+# The Dockerfile COPYs only four paths, so most entries below are about context
+# transfer size and about never letting a secret enter a build layer at all.
+
+# Secrets. Never in an image layer -- Fly reads them from `fly secrets`,
+# Vercel from its project settings. See docs/deployment.md.
+.env
+.env.*
+!.env.example
+
+.git
+.gitignore
+.github
+
+# The web app deploys to Vercel, not into this image.
+node_modules
+apps
+package.json
+package-lock.json
+
+# Host virtualenv: wrong platform, and would shadow the builder's /app/.venv.
+.venv
+**/__pycache__
+**/*.pyc
+**/*.pyo
+.pytest_cache
+.ruff_cache
+.mypy_cache
+
+# Nothing the running service reads.
+docs
+evals
+benchmarks
+infra
+scripts
+supabase
+*.md
+.vscode
+.idea
+.claude

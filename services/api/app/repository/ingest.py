@@ -8,8 +8,14 @@ plain files. All repository content is untrusted data (CLAUDE.md).
 Every failure raises `IngestError` (a ValueError) with a message that says
 what went wrong, so the API can surface it as a 400 instead of a 500.
 
-Known gap: this runs on the host, not inside the analysis container —
-container isolation is deferred (see infra/sandbox/README.md).
+In deployment this runs inside the API container (`services/api/Dockerfile`),
+which is where the isolation comes from: non-root, no toolchain an analyzed
+repo could invoke, immutable application code, and scratch on a `noexec`
+mount. Two gaps remain and are named rather than implied away in
+infra/sandbox/README.md: there is no container per analysis — every scan
+shares this one process — and the container is not network-isolated, so the
+only thing bounding where `git` reaches is the https-only, SSRF-validated URL
+checking below.
 """
 
 from __future__ import annotations

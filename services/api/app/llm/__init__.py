@@ -16,6 +16,7 @@ from app.llm.anthropic_provider import AnthropicProvider
 from app.llm.pricing import PRICES, estimate_cost_usd
 from app.llm.routing import DEFAULT_ROUTES, ModelRoute, UnroutedRoleError
 from app.llm.service import (
+    BudgetGuard,
     CallContext,
     Completion,
     CompletionProvider,
@@ -46,14 +47,31 @@ def anthropic_model_service(
     recorder: UsageRecorder | None = None,
     routes: dict | None = None,
     provider: CompletionProvider | None = None,
+    budget: BudgetGuard | None = None,
 ) -> ModelService:
-    """The production ModelService: Anthropic provider + llm_calls recording."""
+    """The production ModelService: Anthropic provider + llm_calls recording +
+    the per-project cost cap.
+
+    `budget` defaults to the process-wide `ProjectBudgetGuard`, so every
+    production call path is capped without each caller remembering to ask.
+    Imported lazily, like the recorder, to keep `app.llm` importable without
+    dragging in `app.limits` (and through it FastAPI) -- and so a unit test
+    that constructs `RoutedModelService` directly still gets no cap and no
+    database.
+    """
     if recorder is None:
         from app.llm.usage import record_llm_call
 
         recorder = record_llm_call
+    if budget is None:
+        from app.limits.budget import default_budget_guard
+
+        budget = default_budget_guard()
     return RoutedModelService(
-        provider=provider or AnthropicProvider(), recorder=recorder, routes=routes
+        provider=provider or AnthropicProvider(),
+        recorder=recorder,
+        routes=routes,
+        budget=budget,
     )
 
 
@@ -62,6 +80,7 @@ def embedding_model_service(
     recorder: UsageRecorder | None = None,
     routes: dict | None = None,
     embedding_provider: EmbeddingProvider | None = None,
+    budget: BudgetGuard | None = None,
 ) -> ModelService:
     """The production ModelService for the `embed` role: Voyage provider +
     llm_calls recording.
@@ -75,16 +94,22 @@ def embedding_model_service(
         from app.llm.usage import record_llm_call
 
         recorder = record_llm_call
+    if budget is None:
+        from app.limits.budget import default_budget_guard
+
+        budget = default_budget_guard()
     return RoutedModelService(
         provider=AnthropicProvider(),
         recorder=recorder,
         routes=routes,
         embedding_provider=embedding_provider or VoyageProvider(),
+        budget=budget,
     )
 
 
 __all__ = [
     "AnthropicProvider",
+    "BudgetGuard",
     "EmbeddingInputType",
     "EmbeddingNotConfiguredError",
     "EmbeddingProvider",

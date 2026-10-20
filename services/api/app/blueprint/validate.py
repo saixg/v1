@@ -96,6 +96,7 @@ KNOWN_SCHEMA_VERSIONS: frozenset[str] = frozenset({BLUEPRINT_SCHEMA_VERSION})
 # `BLOCKING_CODES` below decides the stored status from them.
 
 UNKNOWN_SCHEMA_VERSION = "unknown_schema_version"
+EMPTY_BLUEPRINT = "empty_blueprint"
 DUPLICATE_COMPONENT_KEY = "duplicate_component_key"
 DUPLICATE_CONNECTION_KEY = "duplicate_connection_key"
 DUPLICATE_FILE_PATH = "duplicate_file_path"
@@ -121,6 +122,7 @@ REPO_WIDE_CONSTRAINT_OVERLAP = "repo_wide_constraint_overlap"
 BLOCKING_CODES: frozenset[str] = frozenset(
     {
         UNKNOWN_SCHEMA_VERSION,
+        EMPTY_BLUEPRINT,
         DUPLICATE_COMPONENT_KEY,
         DUPLICATE_CONNECTION_KEY,
         DUPLICATE_FILE_PATH,
@@ -207,6 +209,24 @@ def check_structure(rows: VersionRows) -> list[ValidationError]:
     cycles, intra-version references and the evidence requirement. Pure: no
     I/O, so the whole of this is testable on constructed rows."""
     out: list[ValidationError] = []
+
+    # A version with no components proposes nothing, and every other check
+    # here passes trivially on it: no keys to collide, no endpoints to
+    # dangle, no cycle, no ungrounded claim. Without this it would validate
+    # clean and be promoted — so a model reply that was schema-valid but
+    # empty (`{}` resolves to zero components, since every field has a
+    # default) would silently replace a good design with a blank one. An
+    # empty design is a failure of the pass that produced it, recorded as
+    # such rather than served as a result.
+    if not rows.components:
+        out.append(
+            _err(
+                EMPTY_BLUEPRINT,
+                "this version proposes no components; an empty design is recorded as invalid "
+                "rather than served, and never replaces a design that has one",
+                entity_kind="blueprint",
+            )
+        )
 
     if rows.version.schema_version not in KNOWN_SCHEMA_VERSIONS:
         out.append(

@@ -89,6 +89,13 @@ from app.knowledge.retrieval import (
     insert_chat_message,
     list_chat_messages,
 )
+from app.limits import (
+    BudgetCheckUnavailableError,
+    BudgetExceededError,
+    enforce_mcp_rate_limit,
+    enforce_rate_limit,
+    read_budget_status,
+)
 from app.llm import (
     CallContext,
     ModelService,
@@ -109,16 +116,44 @@ app.add_middleware(RequestLoggingMiddleware)
 
 # Agent Context Engine (tasks, ledger, packages, tokens) and its read-only MCP
 # endpoint. Each module authorizes in app code; see their docstrings.
-app.include_router(context_router)
-app.include_router(mcp_router)
+# Rate limiting is attached at include time rather than route by route, so
+# the routers owned by other modules need no edit to be protected and the
+# whole policy stays readable in one table (app/limits/ratelimit.py's
+# `_ROUTE_BUCKETS`). `enforce_rate_limit` depends on `CurrentUser`, so it
+# cannot run before the token is verified -- an unverified key would be
+# forgeable. The MCP router gets its own limiter: it authenticates with a
+# per-repo bearer token and never sees a Clerk identity at all.
+app.include_router(context_router, dependencies=[Depends(enforce_rate_limit)])
+app.include_router(mcp_router, dependencies=[Depends(enforce_mcp_rate_limit)])
 
 # Virtual Development Environment (blueprints). Same app-layer authorization
 # contract; see app/blueprint_api.py's docstring.
-app.include_router(blueprint_router)
+app.include_router(blueprint_router, dependencies=[Depends(enforce_rate_limit)])
+
+# Browser origins allowed to call this API. Reuses `CLERK_ALLOWED_ORIGINS`
+# rather than introducing a second list: it already names the web origins
+# trusted to use this backend's tokens (checked against a token's `azp`
+# claim in app/auth.py), and two lists that must agree but are configured
+# separately will eventually disagree. Unset falls back to the dev origin,
+# which is why a deployed API must set it — a Vercel frontend calling a Fly
+# API with this unset gets a CORS failure, not a quiet degradation.
+_cors_origins = [
+    origin.strip()
+    for origin in os.environ.get("CLERK_ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+    if origin.strip()
+]
+if "*" in _cors_origins:
+    # Credentialed requests and `*` are mutually exclusive per the CORS spec,
+    # and this API is only ever called with an Authorization header. Refusing
+    # at startup beats shipping an origin list the browser will ignore.
+    raise RuntimeError(
+        "CLERK_ALLOWED_ORIGINS must name explicit origins; '*' cannot be used "
+        "with the credentialed requests this API serves"
+    )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=_cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -127,6 +162,41 @@ app.add_middleware(
 @app.exception_handler(IngestError)
 async def _ingest_error(_: Request, exc: IngestError) -> JSONResponse:
     return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+
+@app.exception_handler(BudgetExceededError)
+async def _budget_exceeded(_: Request, exc: BudgetExceededError) -> JSONResponse:
+    """A cost-cap refusal, as an explained error rather than a 500.
+
+    402 Payment Required, because that is precisely what happened: the work
+    was refused on cost, the provider was never called, and nothing was
+    charged. Distinct from 502 `model_call_failed` (the provider failed, retry
+    may help) and from 429 (too fast, wait and retry) -- retrying this changes
+    nothing until the cap is raised or the window rolls over, so the payload
+    says where the user stands and when that is.
+    """
+    return JSONResponse(
+        status_code=402,
+        content={
+            "error": "cost_cap_exceeded",
+            "detail": str(exc),
+            "project_id": exc.project_id,
+            "operation": exc.operation,
+            "spend_usd": round(exc.spend_usd, 6),
+            "cap_usd": exc.cap_usd,
+            "window_start": exc.window_start.isoformat(),
+        },
+    )
+
+
+@app.exception_handler(BudgetCheckUnavailableError)
+async def _budget_unavailable(_: Request, exc: BudgetCheckUnavailableError) -> JSONResponse:
+    """The spend ledger could not be read, so the call was refused rather than
+    run uncapped. 503: our outage, and retrying is the right response."""
+    return JSONResponse(
+        status_code=503,
+        content={"error": "cost_cap_unavailable", "detail": str(exc)},
+    )
 
 
 @app.get("/health")
@@ -158,6 +228,44 @@ def post_project(req: CreateProjectRequest, user: CurrentUser) -> ProjectWithRol
 def get_projects(user: CurrentUser) -> dict[str, list[ProjectWithRole]]:
     with api_connection() as conn:
         return {"projects": list_projects_for_user(conn, user.id)}
+
+
+@app.get("/projects/{project_id}/spend")
+def project_spend(project_id: str, user: CurrentUser) -> dict:
+    """This project's model spend for the current month, and its cap.
+
+    build-plan.md Part 11 asks for "model cost and failures observable". Both
+    come from the same append-only `codeaxis.llm_calls` read the cost cap
+    enforces against, so what this route reports and what the cap does can
+    never disagree.
+
+    Two things are reported rather than hidden:
+    - `unpriced_calls` -- calls whose model is not in `app/llm/pricing.py`, so
+      their cost is unknown. `spend_usd` is a lower bound whenever this is
+      non-zero, and `spend_is_complete` says so outright instead of letting a
+      total look authoritative.
+    - `failed_calls` -- refusals, truncations and transport errors were all
+      paid for, so they count towards spend; surfacing the number is what
+      makes a run of failures visible as a cost rather than just as an
+      outage.
+    """
+    require_project_member(project_id, user)
+    status = read_budget_status(project_id)
+    window = status.window
+    return {
+        "project_id": project_id,
+        "window": "calendar_month_utc",
+        "window_start": status.window_start.isoformat(),
+        "spend_usd": round(window.spend_usd, 6),
+        "cap_usd": status.cap_usd,
+        "cap_source": status.cap_source,
+        "remaining_usd": round(status.remaining_usd, 6),
+        "exceeded": status.exceeded,
+        "calls": window.calls,
+        "failed_calls": window.failed_calls,
+        "unpriced_calls": window.unpriced_calls,
+        "spend_is_complete": window.unpriced_calls == 0,
+    }
 
 
 # ------------------------------------------------------------- jobs
@@ -222,7 +330,11 @@ def _stage_response(repo: Repo, checkout: MaterializedCheckout) -> StageRepoResp
     )
 
 
-@app.post("/repos/stage", response_model=StageRepoResponse)
+@app.post(
+    "/repos/stage",
+    response_model=StageRepoResponse,
+    dependencies=[Depends(enforce_rate_limit)],
+)
 def stage(source: IngestSource, project_id: str, user: CurrentUser) -> StageRepoResponse:
     """Register a repo under `project_id` (query parameter). Membership is
     checked before anything is fetched or written."""
@@ -231,7 +343,11 @@ def stage(source: IngestSource, project_id: str, user: CurrentUser) -> StageRepo
     return _stage_response(repo, checkout)
 
 
-@app.post("/repos/upload", response_model=StageRepoResponse)
+@app.post(
+    "/repos/upload",
+    response_model=StageRepoResponse,
+    dependencies=[Depends(enforce_rate_limit)],
+)
 async def upload(file: UploadFile, project_id: str, user: CurrentUser) -> StageRepoResponse:
     await run_in_threadpool(require_project_member, project_id, user)
     # The upload itself is capped at the same size as the extracted archive
@@ -263,7 +379,11 @@ class ConfirmResponse(BaseModel):
     job_id: str
 
 
-@app.post("/repos/{repo_id}/confirm", response_model=ConfirmResponse)
+@app.post(
+    "/repos/{repo_id}/confirm",
+    response_model=ConfirmResponse,
+    dependencies=[Depends(enforce_rate_limit)],
+)
 def confirm(
     repo: RepoAccess, req: ConfirmRequest, background_tasks: BackgroundTasks
 ) -> ConfirmResponse:
@@ -571,7 +691,7 @@ def _result_payload(result: RetrievalResult, *, include_content: bool) -> list[d
     return items
 
 
-@app.get("/repos/{repo_id}/search")
+@app.get("/repos/{repo_id}/search", dependencies=[Depends(enforce_rate_limit)])
 def repo_search(
     repo: RepoAccess,
     commit_sha: str,
@@ -644,7 +764,7 @@ def _chat_thread(
     return thread
 
 
-@app.post("/repos/{repo_id}/chat")
+@app.post("/repos/{repo_id}/chat", dependencies=[Depends(enforce_rate_limit)])
 def repo_chat(
     repo: RepoAccess,
     req: ChatRequest,

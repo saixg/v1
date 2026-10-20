@@ -569,3 +569,159 @@ carrying 17 coded reasons, surfaced per entity in the UI; *edits preserve
 approved decisions* — `locked` is a hard block in the regeneration pass and a
 409 at the route. **Pillar 3 is complete in substance**, with the six gaps
 above outstanding.
+
+## 2026-10-20 update: Phase 6 — hardening, limits, deployment, and three more file-read vectors
+
+Part 13 decision #1 settled first: **`services/api` deploys to Fly.io as a
+container; `apps/web` to Vercel.** Serverless was ruled out on evidence, not
+preference — the API shells out to the `git` binary, loads native C extensions
+(`tree-sitter-language-pack`, `python-igraph`, `leidenalg`), runs minutes-long
+scans, and needs a writable filesystem for scratch checkouts. That makes
+Docker non-optional: it is both the deploy format Fly takes and the fix for
+the analysis-sandbox gap `ingest.py` had been admitting since Phase 1.
+
+Audit first, per §0.2. Two Phase 6 items turned out to be **already built**:
+incremental re-index (chunk reuse keyed on `content_hash`) and stale-index
+handling (package staleness + regrounding). The rest was genuinely missing and
+was built in three parallel tracks.
+
+**Deploy.** `services/api/Dockerfile` (multi-stage, `uv sync --frozen`,
+non-root uid 10001, `git` present but no compilers/node/curl left in the
+runtime image), root `.dockerignore`, `fly.toml` (`bom` region to sit beside
+the Supabase pooler in ap-south-1, `auto_stop_machines = "off"` because an
+in-process `BackgroundTasks` scan must not be killed by a suspending machine),
+`infra/sandbox/run-hardened.sh` (read-only rootfs, noexec tmpfs scratch,
+`--cap-drop ALL`, `no-new-privileges`, cpu/mem/pid caps), a rewritten
+`infra/sandbox/README.md` naming 10 properties provided and 7 gaps remaining,
+and `docs/deployment.md` (435 lines, written for an operator who has not read
+any of this). `ingest.py`'s stale "runs on the host, isolation deferred"
+docstring now describes what is actually true.
+
+Two honesty corrections came out of that work. The sandbox README had claimed
+**"no outbound network," which was false** — Postgres, Clerk, Anthropic and
+GitHub are all required; the claim is retracted. And on Fly **none of the
+`docker run` hardening flags apply**; only image-level properties survive,
+which the README now says instead of implying otherwise. The image is
+**unbuilt** — Docker is not installed in this environment, so the Dockerfile
+is reasoned-only and carries no measured size. Said plainly rather than
+papered over.
+
+**Limits** (`app/limits/{budget,ratelimit}.py`, `app/knowledge/spend.py`,
+migration `20261022000000_cost_caps.sql`, applied additively to the live DB).
+Cost caps now **refuse work** instead of recording it after the fact: the
+check sits at the single chokepoint every model path funnels through
+(`RoutedModelService._call`/`_embed_once`), so no caller can bypass it, and a
+refused call never reaches the provider and writes no `llm_calls` row.
+`BudgetExceededError` is deliberately **not** a `ModelServiceError`, so the
+existing `except ModelServiceError -> 502` cannot mislabel a budget refusal as
+a provider failure; it surfaces as `402 cost_cap_exceeded` with the numbers,
+and **fails closed** when the ledger is unreadable. Scope is per project per
+UTC calendar month, with a per-project override column. Stated limits, not
+hidden: it is a **soft ceiling with bounded overshoot** (the in-flight calls),
+not a credit limit — a hard one needs a write-ahead reservation ledger; and
+there is no per-user cap, because `llm_calls` has no `user_id`, so one user
+with twenty projects gets twenty caps.
+
+Rate limiting is dependency-free fixed-window counters keyed on the
+**verified** Clerk `sub` (a dependency, not middleware — an unverified key is
+forgeable). **Blunt, and `# STUB(CodeAxis):`-marked: the limiter is
+per-machine, not global**, so scaling Fly out multiplies every limit. The
+global ceiling is the cost cap, which is genuinely global because it reads a
+shared ledger. The MCP endpoint got its own limiter keyed on the token hash,
+running *before* token verification so brute force is throttled too — easy to
+overlook, since MCP authenticates by per-repo bearer token and never sees a
+Clerk identity.
+
+Connection pooling landed in `app/knowledge/db.py` without changing
+`api_connection()`/`worker_connection()` semantics, which hundreds of call
+sites depend on. Notably it avoids `psycopg_pool`'s own `pool.connection()`
+because that **commits on exit**, while this codebase relies on "no commit
+means nothing persisted" (there is a live-DB test pinning that). Retry is
+confined to `retry_read` — reads are idempotent, writes that may have
+partially committed are not, and the project's discipline is to refuse rather
+than guess. `GET /projects/{id}/spend` makes the cap visible before it bites,
+and reports `unpriced_calls`/`spend_is_complete` rather than passing an
+incomplete total off as authoritative.
+
+**Tests and CI.** `.github/workflows/ci.yml` now runs a
+`pgvector/pgvector:pg16` service, applies the migrations in order, creates the
+two roles, and sets the three DB URLs — so the DB-integration suite actually
+executes in CI. It previously did not: every DB-gated test silently skipped,
+which is why this file's own "600+ passing" counts were never anything CI had
+reproduced. `CODEAXIS_REQUIRE_DB=1` turns a DB-gated skip into a **failed**
+run, so CI can never again go green while running none of it. Plain Postgres
+lacks what the migrations assume (`auth.users`, `auth.uid()`, the
+`authenticated` role, an `extensions` schema), so `.github/ci/supabase_shim.sql`
+fakes that minimum and `scripts/apply_migrations.py` replays migrations in
+filename order. Verified locally against a real Postgres 16 + pgvector in a
+clean checkout: **897 passed, 2 skipped** — against **402 passed, 227
+skipped** without a database, which is the measure of how much had been
+invisible. **Unverified: the workflow has never run on GitHub.**
+
+Frontend tests exist for the first time: Vitest 4.1.12 + React Testing
+Library, **43 tests** over the places where logic rather than layout lives —
+`api.ts`'s error shaping and discriminators, the blueprint kind/mapping
+pairing (deliberately breaking `KIND_MAPPING` was confirmed to fail them), the
+layout fallback, stale/invalid badging, and the delete control. Versions were
+pinned one major back in three places on purpose: vitest 5, jest-dom 7 and
+jsdom 30 need Node 22 and CI runs Node 20.
+
+Failure-mode tests cover Phase 6's four named kinds (hostile repos, failed
+model calls, conflicting requirements, unauthorized access). The
+unauthorized-access work found a real hole in the **test harness**: FastAPI
+0.143 wraps included routers, so `test_auth.py`'s every-route sweep had never
+seen the context, blueprint or MCP routes at all. The traversal is fixed and
+now guards itself against the OpenAPI schema, and 46 routes are each checked
+to refuse a signed-in stranger. No missing route guard turned up in the app
+itself.
+
+**A third arbitrary-file-read vector, found and fixed.** The scanner followed
+symlinks, so a repository containing `notes.md -> /etc/passwd` had the host
+file's bytes stored as repository content and served back through
+search/chat. `walk()` in `scanner.py` now skips symlinks, as do `manifests.py`
+and `entrypoints.py`. This is the same class as the two fixed on 2026-10-19
+(local-path ingestion, SSRF) and the third in a row found by looking rather
+than by being reported — worth noting as a pattern: untrusted filesystem
+input has been this codebase's weakest edge.
+
+**A design-destroying bug, found and fixed.** A schema-valid but empty model
+reply (an empty object resolves to zero components, since every field has a
+default) validated **clean** — every structural check passes trivially when
+there is nothing to check — and was therefore promoted, silently replacing a
+good design with a blank one. Added `EMPTY_BLUEPRINT` as a blocking
+validation code: a version that proposes nothing is recorded invalid with its
+reason and never replaces a design that has components. Three existing tests
+had been constructing component-free rows as shorthand; they were given a
+component rather than the rule being weakened.
+
+**Three deployment blockers fixed by this session, each verified by running:**
+1. CORS was hardcoded to `http://localhost:3000` — the Vercel frontend could
+   not have called the Fly API at all. Now driven by `CLERK_ALLOWED_ORIGINS`,
+   reusing the list that already names trusted browser origins rather than
+   adding a second one to drift. A wildcard is **refused at startup**,
+   because this API is always called with an Authorization header and the
+   CORS spec forbids a wildcard with credentials.
+2. `.env.example` had been edited to rename `CLERK_PUBLISHABLE_KEY` to the
+   `NEXT_PUBLIC_` form, but `app/auth.py` reads the original name and fails
+   closed — deploying from that file would have been a total auth outage.
+   Restored, with a comment explaining why the prefixed name belongs only in
+   `apps/web/.env.local`.
+3. `NEXT_PUBLIC_API_URL` fell back to `localhost:8000` silently. Next.js
+   inlines `NEXT_PUBLIC_*` at build time, so a forgotten value shipped a
+   working build that could not reach its API. A production build now
+   **throws** — confirmed by running `next build` both without the variable
+   (fails, with the reason) and with it (succeeds).
+
+**Still open, named not hidden:** the Fly `kill_timeout` tops out at 300s, so
+a scan longer than five minutes is killed on deploy and its `jobs` row stays
+`running` forever — there is no reaper, and the guide says "deploy when no
+scan is running", which is a workaround and not a fix. No Fly volume for
+scratch (volumes mount root-owned and uid 10001 cannot chown it), so scratch
+lives on the machine rootfs. Container-per-analysis remains the sandbox's
+biggest gap: every scan shares one process. Rate limits are per-machine. The
+4 GB memory figure is reasoned, never measured against the benchmark repos.
+`supabase db push` is still unusable against the live DB (history drift), and
+`scripts/apply_migrations.py` is fresh-DB-only and tracks no state. The
+Inspector's "Control-flow summaries" stub stays: nothing in the graph,
+analyzers or migrations produces control-flow data, and filling it would be
+fabricating a view.

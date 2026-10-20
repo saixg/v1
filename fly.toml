@@ -1,0 +1,112 @@
+# Fly.io configuration for services/api (Part 13 decision #1: the API deploys
+# as a container on Fly, apps/web to Vercel; serverless was ruled out because
+# this service shells out to the git binary, loads native C extensions, runs
+# minutes-long scans and needs a writable scratch filesystem).
+#
+# This file lives at the workspace root, not in services/api, because the
+# Docker build context must be the root: uv.lock and the root pyproject.toml
+# are there. `fly deploy` from the repo root therefore needs no path flags.
+#
+# Secrets are NOT here. Every value below is non-sensitive configuration;
+# credentials go in `fly secrets set` and are enumerated in docs/deployment.md.
+
+app = "codeaxis-api"
+
+# Mumbai, because this deployment's Supabase Postgres is in ap-south-1. Confirm
+# against the pooler host in DATABASE_URL before the first deploy -- the
+# region is in that hostname, and it is the only thing choosing `bom` here.
+# Co-location is not an optimisation: every graph read and
+# every analyzer write goes through app/knowledge, a scan pass issues thousands
+# of statements per repository, and inter-region latency multiplies all of it.
+# If the database ever moves, this line moves with it.
+primary_region = "bom"
+
+[build]
+  dockerfile = "services/api/Dockerfile"
+
+[env]
+  # Must match the Dockerfile's EXPOSE and uvicorn --port.
+  PORT = "8080"
+  LOG_LEVEL = "INFO"
+  # Deliberately left unset, which disables local-path ingestion entirely.
+  # app/repository/ingest.py treats an empty allowlist as "off", and on a
+  # multi-user deployment any value here is an arbitrary-host-path read for any
+  # authenticated user. Do not set this on a shared deployment.
+  # LOCAL_INGEST_ALLOWED_ROOTS = ""
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+
+  # Scale-to-zero is OFF, and this is not a cost preference. Scan jobs run
+  # in-process via FastAPI BackgroundTasks (app/analysis/jobs.py's STUB note:
+  # no queue, no retry, no stale-job reaper). The scan starts AFTER the HTTP
+  # response is sent, so to Fly's autostop heuristics the machine looks idle
+  # while it is doing the most expensive work in the product. Suspending or
+  # stopping it there leaves codeaxis.jobs stuck at `running` with nothing to
+  # reap it. Until jobs move to a real queue, the machine stays up.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  # One worker process (see the Dockerfile's ENTRYPOINT), and a scan occupies
+  # it for minutes. Low limits so Fly load-balances to another machine instead
+  # of queueing behind a scan; `hard_limit` bounds how many concurrent scans a
+  # single machine's memory has to hold.
+  #
+  # Note before scaling out: app/limits/ratelimit.py counts per process, so N
+  # machines means a client gets N times every CODEAXIS_RATE_LIMIT_* value.
+  # docs/deployment.md section 5 covers what to adjust.
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 8
+    hard_limit = 16
+
+  # The existing unauthenticated route in app/main.py. Everything else requires
+  # a Clerk JWT, so /health is the only thing a prober can use.
+  [[http_service.checks]]
+    method = "GET"
+    path = "/health"
+    protocol = "http"
+    interval = "15s"
+    timeout = "5s"
+    grace_period = "20s"
+
+# Sized by reasoning, not measurement: a Full-tier scan of a 1,000+ file
+# repository holds tree-sitter trees, a python-igraph graph and leidenalg
+# clustering in one process, and `uv.lock`'s native extensions are not frugal.
+# Treat 4 GB as a starting point to be confirmed against the benchmark repos;
+# an OOM kill here looks exactly like the lost-job failure above.
+[[vm]]
+  size = "shared-cpu-2x"
+  memory = "4gb"
+
+# The ceiling Fly allows (300s). A SIGTERM during a deploy or a machine replace
+# gives an in-flight scan five minutes to finish; a longer scan is killed and
+# -- because nothing reaps an orphaned job row -- its job stays `running`
+# forever. Deploy when no scan is running, or accept that. This is the single
+# worst interaction between the in-process job runner and any hosting platform,
+# and it is a limitation of the job runner, not of this config.
+kill_signal = "SIGTERM"
+kill_timeout = 300
+
+# No [mounts] block, and that is a decision rather than an omission.
+#
+# Scratch checkouts go to /tmp (the Dockerfile sets TMPDIR=/tmp, and
+# ingest.is_scratch_checkout only treats a checkout as disposable when it is a
+# direct child of tempfile.gettempdir()). On Fly that is the machine's own
+# ephemeral rootfs, which is writable -- a Fly machine is a Firecracker
+# microVM, not a `docker run --read-only` container, so the read-only-rootfs
+# hardening in infra/sandbox/README.md applies to self-hosted Docker runs and
+# not here; the isolation boundary on Fly is the microVM instead.
+#
+# A Fly volume would be the obvious place for scratch, and it does not work:
+# volumes are mounted root-owned, this process is uid 10001, and it has no way
+# to chown the mountpoint. Running as root to fix that would trade a real
+# security property for a disk-accounting one.
+#
+# Consequence the operator must size for: scratch competes with the image for
+# the machine's rootfs. ScanLimits defaults allow a 2 GB checkout and a 500 MB
+# ZIP upload. Check the real headroom with
+#   fly ssh console -C "df -h /tmp"
+# and lower CODEAXIS_SCAN_MAX_TOTAL_SIZE_BYTES in [env] if it is tight.

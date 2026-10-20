@@ -198,7 +198,11 @@ def walk(root: Path, extra_excludes: frozenset[str] = frozenset()):
         rel_dir = _posix_rel(current, root)
         dirnames: list[str] = []
         for entry in sorted(entries, key=lambda e: e.name):
-            if not entry.is_dir():
+            # A symlink in an untrusted checkout can point anywhere on the host
+            # (`notes.md -> /etc/passwd`), and following one would store that
+            # file's bytes as repository content. Never followed, in either
+            # direction; the scan and the exclusion preview share this walk.
+            if entry.is_symlink() or not entry.is_dir():
                 continue
             name = entry.name
             if name in EXCLUDED_DIRS:
@@ -207,7 +211,7 @@ def walk(root: Path, extra_excludes: frozenset[str] = frozenset()):
             if any(fnmatch.fnmatch(child_rel, pattern) for pattern in extra_excludes):
                 continue
             dirnames.append(name)
-        filenames = sorted(e.name for e in entries if e.is_file())
+        filenames = sorted(e.name for e in entries if e.is_file() and not e.is_symlink())
         yield current, dirnames, filenames
         stack = [current / d for d in dirnames] + stack
 

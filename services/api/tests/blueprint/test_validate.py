@@ -17,6 +17,7 @@ from app.blueprint.validate import (
     DUPLICATE_COMPONENT_KEY,
     DUPLICATE_CONNECTION_KEY,
     DUPLICATE_FILE_PATH,
+    EMPTY_BLUEPRINT,
     HARD_CONSTRAINT_CONFLICT,
     IMPLEMENTS_COMPONENT_MISSING,
     REPO_WIDE_CONSTRAINT_OVERLAP,
@@ -117,8 +118,20 @@ def test_known_schema_version_is_accepted():
     assert check_structure(rows(components=[proposed("a")])) == []
 
 
+def test_a_version_with_no_components_is_blocking_invalid():
+    """A schema-valid but empty model reply resolves to zero components
+    (every field has a default), and every other structural check passes
+    trivially on it. Without this rule such a version would validate clean
+    and be promoted, silently replacing a good design with a blank one."""
+    found = check_structure(rows(components=[]))
+    assert EMPTY_BLUEPRINT in codes(found)
+    assert EMPTY_BLUEPRINT in BLOCKING_CODES
+
+
 def test_unknown_schema_version_is_rejected_not_coerced():
-    found = check_structure(rows(version=version(schema_version="2.0.0")))
+    found = check_structure(
+        rows(version=version(schema_version="2.0.0"), components=[proposed("a")])
+    )
     assert codes(found) == [UNKNOWN_SCHEMA_VERSION]
     assert UNKNOWN_SCHEMA_VERSION in BLOCKING_CODES
 
@@ -161,7 +174,11 @@ def test_dangling_endpoints_are_reported_with_the_connection_key():
 
 
 def test_both_endpoints_missing_is_two_errors():
-    found = check_structure(rows(components=[], connections=[dep("e1", "x", "y")]))
+    # Carries an unrelated component so this exercises dangling endpoints
+    # only: a version with none at all is separately invalid (EMPTY_BLUEPRINT).
+    found = check_structure(
+        rows(components=[proposed("unrelated")], connections=[dep("e1", "x", "y")])
+    )
     assert codes(found) == [CONNECTION_SOURCE_MISSING, CONNECTION_TARGET_MISSING]
 
 

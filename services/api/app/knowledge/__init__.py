@@ -74,7 +74,7 @@ from app.knowledge.context import (
     touch_api_token,
     verify_api_token,
 )
-from app.knowledge.db import api_connection, worker_connection
+from app.knowledge.db import api_connection, close_pools, retry_read, worker_connection
 from app.knowledge.jobs import (
     JobAlreadyExistsError,
     create_job,
@@ -121,6 +121,11 @@ from app.knowledge.semantic import (
     upsert_conventions,
     upsert_summaries,
 )
+from app.knowledge.spend import (
+    SpendWindow,
+    project_cost_cap_usd,
+    project_spend_since,
+)
 from app.knowledge.writes import (
     insert_edges,
     insert_nodes,
@@ -132,6 +137,8 @@ from app.knowledge.writes import (
 __all__ = [
     "api_connection",
     "worker_connection",
+    "close_pools",
+    "retry_read",
     "create_repo",
     "get_repo",
     "delete_repo",
@@ -162,6 +169,10 @@ __all__ = [
     "unresolved_summary",
     "insert_llm_call",
     "get_llm_call",
+    # --- Phase 6: cost caps read from the llm_calls ledger ---
+    "SpendWindow",
+    "project_spend_since",
+    "project_cost_cap_usd",
     # --- semantic layer: codeaxis.chunks (build-plan.md Part 4.D) ---
     "insert_chunks",
     "set_chunk_embeddings",

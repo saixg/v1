@@ -59,7 +59,7 @@ def _dependency_node(
 
 def _from_package_json(root: Path, repo_id: str, commit_sha: str) -> list[Node]:
     path = root / "package.json"
-    if not path.is_file():
+    if path.is_symlink() or not path.is_file():
         return []
     try:
         data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
@@ -90,7 +90,7 @@ def _from_package_json(root: Path, repo_id: str, commit_sha: str) -> list[Node]:
 
 def _from_pyproject_toml(root: Path, repo_id: str, commit_sha: str) -> list[Node]:
     path = root / "pyproject.toml"
-    if not path.is_file():
+    if path.is_symlink() or not path.is_file():
         return []
     try:
         data = tomllib.loads(path.read_text(encoding="utf-8", errors="replace"))
@@ -128,7 +128,7 @@ def _from_pyproject_toml(root: Path, repo_id: str, commit_sha: str) -> list[Node
 
 def _from_requirements_txt(root: Path, repo_id: str, commit_sha: str) -> list[Node]:
     path = root / "requirements.txt"
-    if not path.is_file():
+    if path.is_symlink() or not path.is_file():
         return []
     try:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()

@@ -56,7 +56,7 @@ def annotate_entry_points(scanned: list[ScannedNode], root: Path) -> None:
 
 def _package_json_entry_paths(root: Path) -> set[str]:
     path = root / "package.json"
-    if not path.is_file():
+    if path.is_symlink() or not path.is_file():
         return set()
     try:
         data = json.loads(path.read_text(encoding="utf-8", errors="replace"))

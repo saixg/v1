@@ -7,6 +7,7 @@ import { useState } from "react";
 import { AskView } from "@/components/AskView";
 import { BlueprintView } from "@/components/BlueprintView";
 import { CoverageView } from "@/components/CoverageView";
+import { DeleteRepoControl } from "@/components/DeleteRepoControl";
 import { Explorer } from "@/components/Explorer";
 import { Inspector } from "@/components/Inspector";
 import { TaskView } from "@/components/TaskView";
@@ -72,21 +73,24 @@ export function Workspace() {
           <span aria-hidden>·</span>
           <span>Pass 1: files and symbol definitions. Nothing was executed.</span>
         </div>
-        <div className="flex gap-1" role="tablist" aria-label="Workspace view">
-          {(["explore", "ask", "coverage", "context", "build"] as const).map((t) => (
-            <button
-              key={t}
-              type="button"
-              role="tab"
-              aria-selected={tab === t}
-              onClick={() => setTab(t)}
-              className={`rounded px-2 py-1 font-medium capitalize ${
-                tab === t ? "bg-accent/15 text-foreground" : "text-muted hover:bg-panel"
-              }`}
-            >
-              {TAB_LABELS[t]}
-            </button>
-          ))}
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="flex gap-1" role="tablist" aria-label="Workspace view">
+            {(["explore", "ask", "coverage", "context", "build"] as const).map((t) => (
+              <button
+                key={t}
+                type="button"
+                role="tab"
+                aria-selected={tab === t}
+                onClick={() => setTab(t)}
+                className={`rounded px-2 py-1 font-medium capitalize ${
+                  tab === t ? "bg-accent/15 text-foreground" : "text-muted hover:bg-panel"
+                }`}
+              >
+                {TAB_LABELS[t]}
+              </button>
+            ))}
+          </div>
+          <DeleteRepoControl repoId={id} />
         </div>
       </div>
       {tab === "coverage" ? (

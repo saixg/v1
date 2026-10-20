@@ -8,6 +8,7 @@
     "dev:web": "npm run dev -w @codeaxis/web",
     "build:web": "npm run build -w @codeaxis/web",
     "lint:web": "npm run lint -w @codeaxis/web",
+    "test:web": "npm run test -w @codeaxis/web",
     "db:push": "node --env-file-if-exists=.env scripts/db-push.mjs"
   },
   "engines": {

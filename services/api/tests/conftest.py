@@ -221,6 +221,23 @@ def _no_live_embedding_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
 
 
+# ------------------------------------------------- rate limits in tests
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limits() -> None:
+    """Clear the process-wide rate-limit counters before every test.
+
+    `app.limits.ratelimit` keeps its counters in module state, so without
+    this they would accumulate across the whole session and an unrelated test
+    could fail with a 429 depending on test ordering. Each test still
+    exercises the real limiter — only the carry-over between tests is
+    removed.
+    """
+    from app.limits import reset_limits
+
+    reset_limits()
+
+
 # --------------------------------------------- local-path ingestion in tests
 
 @pytest.fixture(autouse=True)
@@ -233,3 +250,32 @@ def _allow_local_ingest(monkeypatch: pytest.MonkeyPatch) -> None:
     paths overrides this explicitly via `monkeypatch`.
     """
     monkeypatch.setenv("LOCAL_INGEST_ALLOWED_ROOTS", tempfile.gettempdir())
+
+
+# ------------------------------------- CI must not silently skip the DB suite
+
+_DB_SKIPS: list[str] = []
+
+
+def pytest_runtest_logreport(report: pytest.TestReport) -> None:
+    """With CODEAXIS_REQUIRE_DB set (CI does), a test skipped for want of the
+    database is a failure of the run, not a note in the summary. That is how
+    the DB-integration suite went unexecuted in CI for months while the local
+    count read as green."""
+    if not os.environ.get("CODEAXIS_REQUIRE_DB") or not report.skipped:
+        return
+    reason = str(report.longrepr[2]) if isinstance(report.longrepr, tuple) else ""
+    if "DATABASE_URL" in reason or "is not applied" in reason:
+        _DB_SKIPS.append(f"{report.nodeid}: {reason}")
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    if _DB_SKIPS and session.exitstatus == 0:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+        reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+        if reporter is not None:
+            reporter.write_line(
+                f"CODEAXIS_REQUIRE_DB is set but {len(_DB_SKIPS)} test(s) were skipped "
+                "for want of the database; first: " + _DB_SKIPS[0],
+                red=True,
+            )
