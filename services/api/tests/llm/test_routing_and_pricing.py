@@ -2,8 +2,8 @@
 
 import pytest
 
-from app.llm import DEFAULT_ROUTES, PRICES, estimate_cost_usd
-from app.llm.routing import UnroutedRoleError, attempt_models, resolve_route
+from app.llm import DEFAULT_ROUTES, GEMINI_ROUTES, PRICES, estimate_cost_usd
+from app.llm.routing import UnroutedRoleError, attempt_models, resolve_route, routed_models
 
 
 def test_routing_table_matches_part_3():
@@ -49,10 +49,55 @@ def test_attempt_models():
 
 
 def test_every_routed_model_is_priced():
-    routed = {r.model for r in DEFAULT_ROUTES.values()} | {
-        r.escalation_model for r in DEFAULT_ROUTES.values() if r.escalation_model
+    """Every table, not just the default one.
+
+    An unpriced model is worse than a mispriced one: its calls record
+    cost_usd = NULL, contribute nothing to the ledger sum app/limits/budget.py
+    reads, and therefore run with no cost cap at all.
+    """
+    for table in (DEFAULT_ROUTES, GEMINI_ROUTES):
+        assert routed_models(table) <= set(PRICES)
+
+
+def test_routed_models_can_exclude_the_embedding_vendor():
+    # scripts/check_model_provider.py checks routed ids against the completion
+    # provider's model list, where an embedding model from another vendor
+    # would read as a missing id.
+    assert "voyage-code-3" in routed_models(GEMINI_ROUTES)
+    assert "voyage-code-3" not in routed_models(GEMINI_ROUTES, completions_only=True)
+    assert routed_models(GEMINI_ROUTES, completions_only=True) == {
+        "gemini-2.5-flash-lite",
+        "gemini-2.5-flash",
+        "gemini-2.5-pro",
     }
-    assert routed <= set(PRICES)
+
+
+def test_gemini_routing_table():
+    assert GEMINI_ROUTES["bulk"].model == "gemini-2.5-flash-lite"
+    assert GEMINI_ROUTES["synth"].model == "gemini-2.5-flash"
+    assert GEMINI_ROUTES["design"].model == "gemini-2.5-flash"
+    assert GEMINI_ROUTES["design"].escalation_model == "gemini-2.5-pro"
+    assert GEMINI_ROUTES["vision"].accepts_images is True
+    # Same shape as the Anthropic table: switching provider changes which
+    # vendor serves a role, not what the role means.
+    assert [r for r, v in GEMINI_ROUTES.items() if v.escalation_model] == ["design"]
+    assert [r for r, v in GEMINI_ROUTES.items() if v.accepts_images] == ["vision"]
+
+
+def test_gemini_cost_estimates():
+    # 1M in + 1M out at the rates in pricing.py. Pro is priced below its
+    # 200K-token threshold, where a 1M-token prompt would bill at the long tier.
+    assert estimate_cost_usd("gemini-2.5-pro", input_tokens=100_000, output_tokens=100_000) == 1.125
+    assert estimate_cost_usd("gemini-2.5-flash", input_tokens=10**6, output_tokens=10**6) == 2.8
+    assert (
+        estimate_cost_usd("gemini-2.5-flash-lite", input_tokens=10**6, output_tokens=10**6) == 0.5
+    )
+
+
+def test_gemini_pro_long_prompt_tier():
+    # Over 200K prompt tokens the whole request bills at $2.50 / $15.00 per MTok.
+    assert estimate_cost_usd("gemini-2.5-pro", input_tokens=200_000, output_tokens=0) == 0.25
+    assert estimate_cost_usd("gemini-2.5-pro", input_tokens=400_000, output_tokens=0) == 1.0
 
 
 def test_cost_estimates():

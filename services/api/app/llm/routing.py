@@ -16,6 +16,14 @@ SONNET = "claude-sonnet-5-5"
 OPUS = "claude-opus-5-5"
 VOYAGE_CODE_3 = "voyage-code-3"
 
+# Gemini. The 2.5 generation on purpose: these are the GA ids, and a routing
+# table is the wrong place to depend on a preview model that can be withdrawn.
+# Confirm against `client.models.list()` before changing one -- an id this
+# table is wrong about is a 404 on every call of that role.
+GEMINI_FLASH_LITE = "gemini-2.5-flash-lite"
+GEMINI_FLASH = "gemini-2.5-flash"
+GEMINI_PRO = "gemini-2.5-pro"
+
 
 @dataclass(frozen=True)
 class ModelRoute:
@@ -60,6 +68,43 @@ DEFAULT_ROUTES: dict[ModelRole, ModelRoute] = {
         max_input_tokens=32_000,
     ),
 }
+
+
+# The same four completion roles on Gemini, for a deployment that has a Gemini
+# key and no Anthropic one. Deliberately the same *shape* as DEFAULT_ROUTES --
+# cheap model for `bulk`, mid model for `synth`/`vision`, mid escalating to the
+# top model for `design` -- so switching provider changes which vendor serves a
+# role and not what the role means.
+#
+# `embed` stays on voyage-code-3 here rather than moving to a Gemini embedding
+# model, and that is not an oversight: `chunks.embedding` is 1024 dimensions of
+# voyage-code-3, so a different embedder means a migration and a re-embed of
+# every stored chunk, not a routing entry. The completion vendor and the
+# embedding vendor are chosen independently, which is why the entry is shared
+# with DEFAULT_ROUTES instead of being left out -- a table missing `embed`
+# would turn a provider switch into an UnroutedRoleError on the chunk pass.
+GEMINI_ROUTES: dict[ModelRole, ModelRoute] = {
+    "bulk": ModelRoute(model=GEMINI_FLASH_LITE, max_tokens=4096),
+    "synth": ModelRoute(model=GEMINI_FLASH),
+    "design": ModelRoute(model=GEMINI_FLASH, escalation_model=GEMINI_PRO),
+    "vision": ModelRoute(model=GEMINI_FLASH, accepts_images=True),
+    "embed": DEFAULT_ROUTES["embed"],
+}
+
+
+def routed_models(
+    routes: dict[ModelRole, ModelRoute], *, completions_only: bool = False
+) -> set[str]:
+    """Every model id a table can send a request to, escalation models included.
+
+    `completions_only` drops the embedding roles, which are served by a
+    different vendor from the completion roles and so are not in the
+    completion provider's model list.
+    """
+    selected = [r for r in routes.values() if not (completions_only and r.dimensions is not None)]
+    return {r.model for r in selected} | {
+        r.escalation_model for r in selected if r.escalation_model
+    }
 
 
 class UnroutedRoleError(LookupError):

@@ -876,3 +876,139 @@ count.
    new values.
 4. **Clerk is a `pk_test` development instance**: user-capped and dev-mode
    badged. A public launch needs a production instance on a custom domain.
+
+## 2026-10-20 update: a Gemini provider, so a model can actually be called
+
+The open item this closes is #2 from the entry above: there is no
+`ANTHROPIC_API_KEY`, a Gemini key was supplied instead, and until now nothing
+in the product that calls a model could run at all. `app/llm` now has a
+second `CompletionProvider` and chooses between the two from the environment.
+
+**It is a second provider, not a second model layer.** `GeminiProvider` is
+~170 lines that map one request and one response; routing, schema validation,
+the one-retry-then-fail rule, the refusal/truncation handling and the
+`llm_calls` row per attempt all stay in `RoutedModelService` and are shared.
+`tests/llm/test_gemini_provider.py` deliberately mirrors
+`test_anthropic_provider.py` assertion for assertion, because the claim worth
+testing is that the behaviour above the provider is unchanged.
+
+**Selection: one variable, and it fails loudly.** `completion_model_service()`
+replaced `anthropic_model_service()` at all six application call sites, so no
+caller names a vendor any more — Part 3's rule, one level further up than it
+reached before. `CODEAXIS_MODEL_PROVIDER` wins when set (an operator with both
+keys needs a way to say which one to spend, and inferring it from the keys
+would make that unexpressible); an unrecognised value raises rather than
+falling back, because a typo must not silently bill the other vendor. Unset,
+whichever vendor has a key; with both or neither, `anthropic` — today's
+behaviour unchanged.
+
+**The provider and its routing table are chosen together and cannot be
+separated.** `GEMINI_ROUTES` is the same four completion roles
+(`gemini-2.5-flash-lite` for `bulk`, `gemini-2.5-flash` for `synth`/`vision`,
+flash escalating to `gemini-2.5-pro` for `design`), so switching vendor
+changes who serves a role and not what the role means. `_PROVIDERS` maps each
+vendor to its own table, and `completion_model_service` takes no `provider` or
+`routes` override at all: either could be passed without the other and
+silently produce a provider holding the other vendor's model names, which is
+a 404 on every call. A caller that means one vendor asks for it by name.
+
+**A real bug found on the way.** `app/analysis/semantic/writer.py` gated the
+entire semantic pass on `ANTHROPIC_API_KEY` being present. With a Gemini key
+and no Anthropic one, every scan would have recorded "skipped: no model
+provider configured" and generated no summaries — the symptom would have
+looked like a broken pass, not a wrong env-var name. The check now asks
+`app.llm.missing_credential_reason()`, which answers for the *selected*
+vendor and names the variables it looked at. `tests/test_summaries.py`'s skip
+test was clearing only the two Anthropic variables, so it would have started
+passing for the wrong reason the moment a Gemini key appeared in the
+environment; it now clears all five.
+
+**`embed` does not move, and that is load-bearing.** `GEMINI_ROUTES["embed"]`
+*is* `DEFAULT_ROUTES["embed"]` — the same voyage-code-3 route object, shared
+rather than duplicated or omitted. `chunks.embedding` is 1024 dimensions of
+that model, so a different embedder is a migration plus a re-embed of every
+stored chunk. Omitting the role instead would have turned a provider switch
+into an `UnroutedRoleError` on the chunk pass; a test pins that both tables
+route the same roles and that the `embed` entries are equal.
+
+**The prices are the weakest part of this change, and they are weak in a
+stated direction.** `ai.google.dev` and `cloud.google.com` are both
+unreachable from this container (`getaddrinfo ENOTFOUND`), so unlike every
+other row in `pricing.py` the three Gemini rows were not read off the vendor's
+page — they are Google's published 2.5-family figures corroborated against
+several third-party trackers, which disagreed with each other on the cache
+rate. Where sources conflicted the **higher** number is used, and that is not
+arbitrary: this table feeds the pre-call cost cap, so over-estimating makes
+the cap refuse slightly early while under-estimating lets a project spend past
+it. Leaving the models out of the table would have been worse than either —
+`estimate_cost_usd` returns None for an unknown model, those rows carry
+`cost_usd = NULL`, and `project_spend_since` sums NULL to nothing, so a
+Gemini-only deployment would have run with **no cost cap at all**.
+`test_every_routed_model_is_priced` now checks every table rather than just
+the default one, which is what makes that hole impossible to reopen by adding
+a route. **The figures still need confirming against the official pricing page
+by someone who can reach it.**
+
+**Two vendor details that would have been silent bugs.** Gemini's
+`prompt_token_count` *includes* `cached_content_token_count`, where
+Anthropic's usage fields are disjoint — so the cached count is subtracted out,
+or cache reads would bill twice, once at the input rate and once at the cache
+rate. And `candidates_token_count` *excludes* `thoughts_token_count` while
+Gemini bills thinking as output, so the two are added. Both are asserted on a
+real `GenerateContentResponse`.
+
+**`finish_reason` mapping.** Seven reasons that mean "the model declined"
+(safety, prohibited content, blocklist, SPII, recitation, language, image
+safety) map to `refusal`, which the service raises on and does not retry; a
+prompt blocked before generation arrives with no candidates and is also a
+refusal; `MAX_TOKENS` maps to `max_tokens`. Anything else — `OTHER`, a
+malformed call, whatever the SDK adds next — is passed through lowercased
+rather than mapped to `end_turn`, so an unrecognised ending shows up in
+`llm_calls.stop_reason` and fails schema validation visibly instead of being
+read as a complete answer.
+
+**Structured output** uses `response_json_schema` (the raw-JSON-Schema field),
+not `response_schema` (the restricted OpenAPI subset, which would drop the
+`$defs`/`$ref` every nested model produces). The SDK's own transform for that
+field is the identity function, so the caller's Pydantic schema goes on the
+wire unchanged.
+
+**Verified:** `uv run ruff check .` clean, `uv run pyright` 0 errors,
+`uv run pytest -q` → **578 passed, 362 skipped** (up from 538 passed at the
+start of this session — the 362 skips are the DB suite, no database in this
+container), `npm run test:web` → 50 passed (unchanged; no frontend change),
+and `uv sync --frozen` resolves, which is what the Dockerfile runs.
+
+Also verified, because a mock cannot: the request *serializes*. Pointing a
+real `genai.Client` at a dead address with a system instruction, an inline
+image and a nested schema carrying `$defs`/`$ref`/`anyOf` fails with
+`ConnectError: Connection refused` — it reached the transport, so the SDK
+accepted everything the provider builds. And with a deliberately invalid key
+against the real endpoint, the whole path runs and returns Google's
+`API_KEY_INVALID`, which is the provider, the request and the error mapping
+all working.
+
+**Still unverified, and it needs a key, not another session.** Three things no
+mock can establish: that a real key is accepted, that these three model ids
+exist for this account (they were written from documentation, not from a
+`models.list`, and a wrong id is a 404 on every call of that role), and that
+Gemini's server accepts the schema as sent rather than merely the SDK.
+`scripts/check_model_provider.py` exists to close all three in one command —
+it names the selected provider, checks every routed id against
+`models.list()` where the SDK offers one, then makes one small call on the
+cheapest routed model and validates the response against a schema. It is
+documented in both `README.md` and `docs/deployment.md`, and it should be the
+first thing run after the key is set.
+
+**One transitive constraint worth knowing:** `google-genai` requires
+`websockets<17`, so the lock moved from 17.2 to 16.1.1. `uvicorn[standard]`
+needs `>=10.4` and is unaffected, but a future dependency wanting
+websockets 17 will now conflict.
+
+**Open, unchanged from the entry above** except that #2's code half is now
+done: Fly still needs a card (nothing else blocks the API deploy), the two
+secrets pasted into a chat transcript still need rotating, and Clerk is still
+a `pk_test` development instance. The Gemini key itself still needs to be put
+into the root `.env` for local use and into `fly secrets` for the deploy —
+this session never had it, and deliberately did not ask for it in a
+transcript.

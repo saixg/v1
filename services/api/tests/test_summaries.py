@@ -400,8 +400,12 @@ def test_total_call_ceiling_stops_the_pass(snap):
 
 
 def test_pass_is_skipped_visibly_without_a_model_key(snap, monkeypatch):
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    # Every vendor's credential, not just Anthropic's: the check now asks the
+    # selected provider, so one key left set in the environment would make
+    # this pass run for real.
+    for var in ("CODEAXIS_MODEL_PROVIDER", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+                "GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
     assert model_provider_configured() is False
     _seed(snap)
 

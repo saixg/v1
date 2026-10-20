@@ -72,7 +72,8 @@ inferred from `.env.example`.
 | Variable | Read by | Unset behaviour |
 | --- | --- | --- |
 | `CLERK_ALLOWED_ORIGINS` | `app/auth.py` | Comma-separated; checked against a token's `azp` claim. Unset skips the check. Set it in production. |
-| `ANTHROPIC_API_KEY` *or* `ANTHROPIC_AUTH_TOKEN` | `app/analysis/semantic/writer.py` | Semantic enrichment is **skipped** and records that as a coverage gap. The scan still completes. |
+| `ANTHROPIC_API_KEY` *or* `ANTHROPIC_AUTH_TOKEN` *or* `GEMINI_API_KEY` *or* `GOOGLE_API_KEY` | `app/llm/__init__.py`, checked by `app/analysis/semantic/writer.py` | With no model key at all, semantic enrichment is **skipped** and records that as a coverage gap (the scan still completes), and chat, requirement extraction and blueprint generation fail. |
+| `CODEAXIS_MODEL_PROVIDER` | `app/llm/__init__.py` | Which vendor serves the completion roles: `anthropic` or `gemini`. Unset, whichever vendor has a key; with both keys, `anthropic`. An unrecognised value is a startup error, so a typo cannot silently bill the other vendor. |
 | `VOYAGE_API_KEY` | `app/llm/voyage_provider.py` | Chunks are stored without vectors, stay keyword-searchable, gap recorded in `codeaxis.coverage`. |
 | `LOG_LEVEL` | `app/logging.py` | `INFO`. |
 | `LOCAL_INGEST_ALLOWED_ROOTS` | `app/repository/ingest.py` | Local-path ingestion is **disabled**, which is what you want. Setting it on a multi-user deployment turns `POST /repos/stage` into an arbitrary-host-path read for any authenticated user. Leave it unset. |
@@ -239,6 +240,24 @@ fly secrets set \
   ANTHROPIC_API_KEY="sk-ant-..." \
   VOYAGE_API_KEY="pa-..."
 ```
+
+To run the completion roles on Gemini instead, set `GEMINI_API_KEY="AIza..."`
+in place of `ANTHROPIC_API_KEY`. Nothing else changes: the provider and its
+routing table are chosen together from that one key. Set both keys and
+Anthropic is used unless `CODEAXIS_MODEL_PROVIDER="gemini"` is set too.
+`VOYAGE_API_KEY` is unaffected either way — embeddings do not move.
+
+Whichever vendor you set, confirm the credential is accepted and the routed
+model ids exist for the account before trusting the deploy. The test suite
+cannot: it mocks every provider.
+
+```bash
+uv run python scripts/check_model_provider.py
+```
+
+It makes one small real call on the cheapest routed model and validates the
+response against a schema, so a wrong key, a withdrawn model id or a provider
+that rejects the schema shows up here rather than on a user's first request.
 
 Confirm the names (not the values) landed:
 

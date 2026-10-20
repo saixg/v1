@@ -52,12 +52,23 @@ a working app:
 | `CLERK_PUBLISHABLE_KEY` | root `.env` | the API fails closed (503) without it |
 | `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`, `CLERK_SECRET_KEY` | `apps/web/.env.local` | no page renders without them |
 
-Optional, each with defined behaviour when unset: `ANTHROPIC_API_KEY`
-(without it, chat, requirement extraction and blueprint generation are
-disabled), `VOYAGE_API_KEY` (without it, chunks are stored unembedded and
+Optional, each with defined behaviour when unset: a model key —
+`ANTHROPIC_API_KEY` **or** `GEMINI_API_KEY` (without either, chat,
+requirement extraction, blueprint generation and semantic enrichment are
+disabled) — `VOYAGE_API_KEY` (without it, chunks are stored unembedded and
 search stays keyword-only, recorded in `codeaxis.coverage`), and
 `LOCAL_INGEST_ALLOWED_ROOTS` (unset disables local-folder import entirely —
 see the security note below).
+
+**Which model vendor runs.** The completion roles are served by Anthropic or
+by Gemini. Set one key and that vendor is used. Set both and Anthropic wins
+unless `CODEAXIS_MODEL_PROVIDER` says otherwise (`anthropic` or `gemini`); a
+value that is neither is a startup error, not a silent fallback to the other
+vendor's bill. No caller names a vendor — `app/llm/routing.py` holds one
+routing table per provider and callers only ever ask for a role. Embeddings
+are separate: they stay on Voyage whichever vendor serves completions,
+because `chunks.embedding` is 1024 dimensions of `voyage-code-3` and changing
+that is a migration plus a re-embed, not a config change.
 
 First-time database setup:
 
@@ -86,6 +97,17 @@ The backend suite needs the three database URLs; without them the
 DB-integration tests skip. CI sets `CODEAXIS_REQUIRE_DB=1`, which turns such
 a skip into a failed run, so CI cannot go green while silently running none of
 them.
+
+Every test mocks the model providers, so no suite needs a model key or spends
+anything. The things a mock cannot prove — that a key is accepted, that the
+routed model ids exist for this account, and that the provider accepts a
+schema as sent — have their own check, which makes one small real call:
+
+```bash
+uv run python scripts/check_model_provider.py
+```
+
+Run it after setting a model key and whenever a routed model changes.
 
 ## Two things worth knowing before you change anything
 

@@ -26,6 +26,7 @@ dependencies = [
   # Part 4.F.1 DOCX task intake: parses the OOXML parts with an lxml parser
   # that has entity resolution off; the zip is bomb-checked before it opens.
   "python-docx>=1.1",
+  "google-genai>=2.0",
 ]
 
 [build-system]

@@ -15,12 +15,16 @@ a skip is recorded as `failed` with an error string that begins `skipped:`.
 from __future__ import annotations
 
 import logging
-import os
 
 import psycopg
 
 from app.knowledge import finish_pass_run, start_pass_run
-from app.llm import CallContext, ModelService, anthropic_model_service
+from app.llm import (
+    CallContext,
+    ModelService,
+    completion_model_service,
+    missing_credential_reason,
+)
 from app.models import PassRun, PassRunStatus
 
 from .conventions import write_conventions_pass
@@ -33,16 +37,17 @@ ANALYZER_VERSION = "0.1.0"
 
 
 def model_provider_configured() -> bool:
-    """Whether an Anthropic credential is present.
+    """Whether the deployment's selected model vendor has a credential.
 
     Checked up front rather than discovered one failed call at a time: with
     no key every call would fail identically, and the honest outcome is one
     recorded skip, not hundreds of error rows.
+
+    Which vendor that is, and which variables count for it, belongs to
+    `app.llm` -- asking about one vendor's variable here is what made this
+    skip a Gemini-only deployment's entire semantic pass.
     """
-    return bool(
-        os.environ.get("ANTHROPIC_API_KEY")
-        or os.environ.get("ANTHROPIC_AUTH_TOKEN")
-    )
+    return missing_credential_reason() is None
 
 
 def write_semantic_pass(
@@ -78,10 +83,7 @@ def write_semantic_pass(
     if service is None and not model_provider_configured():
         # No key: write the conventions the rules can establish without a
         # model, then record the skip visibly.
-        error = (
-            "skipped: no model provider configured (ANTHROPIC_API_KEY unset); "
-            "summaries were not generated"
-        )
+        error = f"skipped: {missing_credential_reason()}; summaries were not generated"
         try:
             rules = write_conventions_pass(conn, repo_id, commit_sha, service=None)
             logger.info(
@@ -96,7 +98,7 @@ def write_semantic_pass(
         return None
 
     if service is None:
-        service = anthropic_model_service()
+        service = completion_model_service()
 
     context = CallContext(project_id=project_id, repo_id=repo_id, job_id=job_id)
     try:
