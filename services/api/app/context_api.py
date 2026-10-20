@@ -76,7 +76,7 @@ from app.llm import (
     ModelService,
     ModelServiceError,
     StructuredOutputError,
-    anthropic_model_service,
+    model_service,
 )
 from app.models import Constraint, ContextItem, ContextPackage, Task
 
@@ -104,7 +104,7 @@ def get_context_model_service() -> ModelService:
     dependency so tests substitute a scripted provider; no key is read in tests.
     (Separate from `app.main.get_model_service` to avoid a main <-> router
     import cycle.)"""
-    return anthropic_model_service()
+    return model_service()
 
 
 ContextModel = Annotated[ModelService, Depends(get_context_model_service)]

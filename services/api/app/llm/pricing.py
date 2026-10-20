@@ -2,16 +2,25 @@
 not an invoice — the provider's billing is authoritative.
 
 Anthropic first-party list prices, cached 2026-10-06 (claude-api reference);
-Voyage AI list price cached 2026-10-17 (docs.voyageai.com/docs/pricing).
-Update this table when prices change; an unknown model yields cost=None
-(recorded as "not priced"), never a guessed number.
+Voyage AI list price cached 2026-10-17 (docs.voyageai.com/docs/pricing);
+Google Gemini paid-tier list prices cached 2026-10-20
+(ai.google.dev/gemini-api/docs/pricing). Update this table when prices change;
+an unknown model yields cost=None (recorded as "not priced" -- `unpriced_calls`
+in `/projects/{id}/spend`), never a guessed number.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from app.llm.routing import HAIKU, OPUS, SONNET, VOYAGE_CODE_3
+from app.llm.routing import (
+    GEMINI_FLASH,
+    GEMINI_FLASH_LITE,
+    HAIKU,
+    OPUS,
+    SONNET,
+    VOYAGE_CODE_3,
+)
 
 _PER_MTOK = 1_000_000
 
@@ -48,6 +57,39 @@ PRICES: dict[str, ModelPrice] = {
     # input tokens only -- there are no output or cache tokens, hence 0.0.
     VOYAGE_CODE_3: ModelPrice(
         input_per_mtok=0.18, output_per_mtok=0.0, cache_read_per_mtok=0.0
+    ),
+    # Google Gemini paid-tier list prices, read from
+    # ai.google.dev/gemini-api/docs/pricing on 2026-10-20. The text/image/video
+    # input rate is the one used: CodeAxis sends text and (for the vision role)
+    # images, never audio, which bills higher on every Gemini model. Neither
+    # routed Gemini model has a long-prompt tier -- the page applies the
+    # 200K-token tiers only to the Pro models, which nothing routes to.
+    #
+    # `cache_write_multiplier=1.0` because Gemini has no per-token cache-write
+    # charge -- explicit context caching bills *storage* per hour instead, which
+    # is not a per-call cost and cannot be derived from a usage row. Nothing
+    # here sets `cache_creation_input_tokens` for Gemini (the API reports no
+    # such count), so the multiplier is unused rather than wrong; if explicit
+    # caching is ever enabled, its storage cost needs its own ledger entry, not
+    # a fudge factor here.
+    #
+    # DATED: the page lists a scheduled increase on 2027-01-01 -- 3.8-flash
+    # doubles to $1.50 / $7.50 and its cache read to $0.15. `ModelPrice` has no
+    # effective-date support, so on that day this table silently halves every
+    # 3.8-flash estimate (and with it the cost cap's view of spend) until it is
+    # edited. Flagged rather than modelled: a second rate set and a clock is a
+    # bigger change than this table's one job.
+    GEMINI_FLASH_LITE: ModelPrice(
+        input_per_mtok=0.25,
+        output_per_mtok=1.50,
+        cache_read_per_mtok=0.025,
+        cache_write_multiplier=1.0,
+    ),
+    GEMINI_FLASH: ModelPrice(
+        input_per_mtok=0.75,
+        output_per_mtok=3.75,
+        cache_read_per_mtok=0.075,
+        cache_write_multiplier=1.0,
     ),
 }
 

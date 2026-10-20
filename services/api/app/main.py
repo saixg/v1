@@ -101,7 +101,7 @@ from app.llm import (
     ModelService,
     ModelServiceError,
     StructuredOutputError,
-    anthropic_model_service,
+    model_service,
 )
 from app.logging import RequestLoggingMiddleware, configure_logging
 from app.mcp_server import router as mcp_router
@@ -622,14 +622,14 @@ def get_model_service() -> ModelService:
     """The ModelService the chat route narrates with. A FastAPI dependency so
     tests override it with a scripted provider — no API key is used or needed
     anywhere in the test suite."""
-    return anthropic_model_service()
+    return model_service()
 
 
 def _query_embedder() -> ModelServiceEmbedder:
     """The vector stage's embedder. Built from the same ModelService; when
     `embed` is unwired or unkeyed, the stage degrades to skipped and FTS +
     exact-symbol + graph expansion answer on their own."""
-    return ModelServiceEmbedder(anthropic_model_service())
+    return ModelServiceEmbedder(model_service())
 
 
 def _retrieval_query(

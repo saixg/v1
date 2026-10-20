@@ -71,7 +71,7 @@ from app.llm import (
     ModelService,
     ModelServiceError,
     StructuredOutputError,
-    anthropic_model_service,
+    model_service,
 )
 from app.models import (
     BLUEPRINT_SCHEMA_VERSION,
@@ -111,7 +111,7 @@ def get_blueprint_model_service() -> ModelService:
     function rather than a FastAPI dependency because the generation pass runs
     in a background task, where the request's dependency scope is already
     gone; tests monkeypatch this name."""
-    return anthropic_model_service()
+    return model_service()
 
 
 # ------------------------------------------------------------- dependencies

@@ -876,3 +876,117 @@ so none of the above regressed anything.
    new values.
 4. **Clerk is a `pk_test` development instance**: user-capped and dev-mode
    badged. A public launch needs a production instance on a custom domain.
+
+## 2026-10-20 update: Gemini provider added beside Anthropic (user instruction)
+
+User explicitly asked for a Google Gemini provider: there is no Anthropic key
+and a working Gemini one, so every model-backed feature (grounded chat,
+requirement extraction, blueprint generation, Inspector explanations,
+summaries) was dead code. `build-plan.md` Part 3's routing table names Claude
+models and is **superseded for the default path by this entry** (not re-edited
+in the doc itself, per Part 0.1). Anthropic is not replaced — it is now one of
+two providers, selected by `CODEAXIS_LLM_PROVIDER`, and
+`anthropic_model_service()` still works unchanged for when a key exists again.
+
+**What shipped:**
+- `app/llm/gemini_provider.py`: one POST to
+  `v1beta/models/{model}:generateContent`, `httpx` rather than a new
+  dependency, `x-goog-api-key` header (a Bearer token 401s — verified, not
+  assumed). Two pure functions plus a thin client, mirroring
+  `anthropic_provider.py`; `GEMINI_API_KEY` is read at request time so
+  importing never needs credentials.
+- `app/llm/gemini_schema.py`: the JSON Schema → `responseSchema` transform.
+  Gemini takes an OpenAPI 3.0 subset and rejects most of what
+  `model_json_schema()` emits. `$ref`/`$defs` are inlined (repeated refs at
+  every use site; a genuinely recursive schema raises `RecursiveSchemaError`
+  rather than unrolling to a depth Pydantic will not validate against),
+  `anyOf: [X, {type: null}]` becomes `nullable`, `const` becomes a one-value
+  `enum`, and everything outside `{type, properties, required, items, enum,
+  description, nullable}` is dropped — but every dropped keyword that
+  *constrains a value* (`pattern`, lengths, bounds, `maxItems`, `format`,
+  `default`) is restated in the field's `description`, because
+  `RoutedModelService` still validates with Pydantic afterwards and a lost
+  constraint would surface as a retry and then a `StructuredOutputError`.
+- `app/llm/routing.py`: one completion table per provider; `embed` is a single
+  shared route and was not touched (`chunks.embedding` is 1024-dimension
+  `voyage-code-3`; changing it is a migration).
+- `app/llm/__init__.py`: `model_service()` is the new production factory — it
+  picks the provider and *its* routing table together. All four callers
+  (`main.py`, `context_api.py`, `blueprint_api.py`,
+  `analysis/semantic/writer.py`) now route through it. The budget guard and
+  `llm_calls` recorder sit above the provider layer and were verified
+  unchanged: a new provider cannot bypass the cost cap.
+- `pricing.py`: entries for both routed Gemini models, so the ledger and the
+  cost cap record real numbers instead of zero.
+- 56 new tests (`tests/llm/test_gemini_{provider,schema}.py`,
+  `test_provider_selection.py`), all offline — `httpx` mocked at
+  `Client.post`, with real `httpx.Response` objects.
+
+**The routing table was wrong until it was run, which is the main finding.**
+`ListModels` on the owner's key lists the whole `gemini-2.5-*` family, so the
+first table routed to `gemini-2.5-flash` / `-flash-lite` / `-pro`. Every one
+of them **404s** on `generateContent`: *"no longer available to new users."*
+A listing is not evidence that a model serves. The table is now built only
+from ids that returned 200 to a real one-token request on 2026-10-20:
+
+| Role | Model | Why |
+|---|---|---|
+| `bulk` | `gemini-3.1-flash-lite` | cheapest GA model that serves ($0.25/$1.50); per-symbol summaries are the easiest work and the highest volume, so unit price dominates |
+| `synth` | `gemini-3.8-flash` | newest GA flash tier, and the model Google's own 404 body names as the replacement for the withdrawn 2.5 family |
+| `design` | `gemini-3.8-flash` | same; **no escalation model** — see the gap below |
+| `vision` | `gemini-3.8-flash` | natively multimodal, so no separate vision tier to price or evaluate |
+| `embed` | `voyage-code-3` | unchanged |
+
+Previews are off the default path deliberately: `gemini-3-flash-preview` does
+serve, but the 2.5 withdrawal just demonstrated that a model disappearing
+under a running analysis is not hypothetical. `gemini-3.5-flash` and
+`gemini-3.7-flash` are also excluded even though they serve — they answer as a
+*different* `modelVersion` (3.6-flash and 3.8-flash respectively), so routing
+to them would record a `served_model` the table never chose.
+
+**Live call, as asked.** One real `generate_structured` against
+`gemini-3.8-flash` using the project's own `RequirementExtraction` schema:
+parsed into the Pydantic model on the **first attempt**, no retry.
+`served_model=gemini-3.8-flash`, 49 input / 539 output tokens,
+`cost_usd=0.002058`, `stop_reason=end_turn`, one `succeeded` ledger row. Both
+extracted requirements carried a verbatim quote from the source chunk. This is
+the first evidence that the transform works against a schema that actually
+ships, rather than against a test model.
+
+**Named gaps:**
+1. **No escalation model for `design`.** Part 3's shape is mid-tier escalating
+   to a top tier for deep-plan mode and after a failed schema validation, but
+   **no Pro model is reachable on this key**: `gemini-3.1-pro-preview` returns
+   429 "exceeded your current quota" on a one-token request, and
+   `gemini-2.5-pro` is withdrawn. Naming an unreachable escalation would make
+   deep-plan mode fail 100% of the time rather than degrade, so both attempts
+   stay on 3.8-flash. Marked `STUB(CodeAxis)`; fill in when the account has
+   Pro quota.
+2. **Latency is much worse than Anthropic's and the timeout was raised to
+   600s.** The live call took **103 seconds** for 539 output tokens — these
+   models think by default and nothing arrives until thinking finishes. Voyage's
+   120s ceiling would have turned ordinary slowness into a `ModelCallError` on
+   any real `design` prompt. Streaming is the real fix and is not built:
+   `CompletionProvider.complete` is a single request/response contract, so
+   adding it is a service-layer change.
+3. **A scheduled price increase this table cannot express.** Google lists
+   3.8-flash doubling to $1.50/$7.50 on 2027-01-01. `ModelPrice` has no
+   effective-date support, so on that day every estimate — and the cost cap's
+   view of spend — silently halves until the table is edited. Flagged in
+   `pricing.py` rather than modelled.
+4. **A multi-branch `anyOf`** (a real union, not the optional idiom) keeps only
+   its first branch's structure, with the alternatives written into the
+   description. The supported subset has no sum type. No shipping schema has
+   one today.
+5. **Not verified: whether the transform's dropped-constraint descriptions
+   actually improve first-attempt compliance.** One live call passed first
+   try; that is a data point, not a measurement. It belongs to the Part 9 eval
+   harness.
+
+**Verified by running:** `uv run ruff check .` clean, `uv run pyright` 0
+errors, `uv run pytest services/api/tests/llm -q` → 121 passed, and
+`services/api/tests/{context,blueprint}` → 154 passed against the live DB,
+proving the four re-pointed callers still work. The live Gemini call above.
+**Reasoned, not run:** the vision role with a real image (no fixture image
+flows through `generate_structured` in the suite — the request mapping is
+unit-tested, the round trip is not), and the `bulk` role under real volume.

@@ -20,7 +20,7 @@ import os
 import psycopg
 
 from app.knowledge import finish_pass_run, start_pass_run
-from app.llm import CallContext, ModelService, anthropic_model_service
+from app.llm import CallContext, ModelService, model_service
 from app.models import PassRun, PassRunStatus
 
 from .conventions import write_conventions_pass
@@ -96,7 +96,7 @@ def write_semantic_pass(
         return None
 
     if service is None:
-        service = anthropic_model_service()
+        service = model_service()
 
     context = CallContext(project_id=project_id, repo_id=repo_id, job_id=job_id)
     try:
